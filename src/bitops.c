@@ -102,6 +102,7 @@ long long popcountAVX2(void *s, long count) {
     /* Part A: loop unrolling, processing 8 * 32 bytes per iteration. */
     while (i + 8 * 32 <= count) {
         __m256i local = _mm256_setzero_si256();
+        valkey_prefetch(p + i + 512);
         ITER_32_BYTES
         ITER_32_BYTES
         ITER_32_BYTES
@@ -154,6 +155,7 @@ long long popcountScalar(void *s, long count) {
     while (count >= 28) {
         uint32_t aux1, aux2, aux3, aux4, aux5, aux6, aux7;
 
+        valkey_prefetch((char *)p4 + 256);
         aux1 = *p4++;
         aux2 = *p4++;
         aux3 = *p4++;
@@ -203,6 +205,7 @@ long long popcountNEON(void *s, long n) {
 
     /* Process 64-byte blocks using unrolled loop (4 x 16-byte vectors) */
     for (; p <= e - 64; p += 64) {
+        valkey_prefetch(p + 256);
         /* Load 4 vector registers (16 bytes each) */
         uint8x16_t v0 = vld1q_u8(p);
         uint8x16_t v1 = vld1q_u8(p + 16);
