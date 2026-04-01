@@ -136,6 +136,90 @@ long long popcountAVX2(void *s, long count) {
 
     return bits;
 }
+
+/* AVX-512 version of popcount using the same parallel lookup table algorithm
+ * as AVX2, but with 512-bit vectors (64 bytes per iteration). */
+ATTRIBUTE_TARGET_AVX512
+long long popcountAVX512(void *s, long count) {
+    long i = 0;
+    unsigned char *p = (unsigned char *)s;
+    long long bits = 0;
+
+    /* clang-format off */
+    const __m512i lookup = _mm512_setr_epi8(
+        /* Lane 0 */
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+        /* Lane 1 */
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+        /* Lane 2 */
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+        /* Lane 3 */
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+    /* clang-format on */
+    const __m512i low_mask = _mm512_set1_epi8(0x0f);
+    __m512i acc = _mm512_setzero_si512();
+
+/* Count 64 bytes per iteration. */
+#define ITER_64_BYTES                                                             \
+    {                                                                             \
+        const __m512i vec = _mm512_loadu_si512((const __m512i *)(p + i));         \
+        const __m512i lo = _mm512_and_si512(vec, low_mask);                       \
+        const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(vec, 4), low_mask); \
+        const __m512i popcnt1 = _mm512_shuffle_epi8(lookup, lo);                  \
+        const __m512i popcnt2 = _mm512_shuffle_epi8(lookup, hi);                  \
+        local = _mm512_add_epi8(local, popcnt1);                                  \
+        local = _mm512_add_epi8(local, popcnt2);                                  \
+        i += 64;                                                                  \
+    }
+
+    /* We divide the array into the following three parts
+     *        Part A         Part B       Part C
+     * +-----------------+--------------+---------+
+     * | 8 * 64bytes * X |  64bytes * Y | Z bytes |
+     * +-----------------+--------------+---------+
+     */
+
+    /* Part A: loop unrolling, processing 8 * 64 bytes per iteration. */
+    while (i + 8 * 64 <= count) {
+        __m512i local = _mm512_setzero_si512();
+        valkey_prefetch(p + i + 1024);
+        ITER_64_BYTES
+        ITER_64_BYTES
+        ITER_64_BYTES
+        ITER_64_BYTES
+        ITER_64_BYTES
+        ITER_64_BYTES
+        ITER_64_BYTES
+        ITER_64_BYTES
+        acc = _mm512_add_epi64(acc, _mm512_sad_epu8(local, _mm512_setzero_si512()));
+    }
+
+    /* Part B: when the remaining data length is less than 8 * 64 bytes,
+     * process 64 bytes per iteration. */
+    __m512i local = _mm512_setzero_si512();
+    while (i + 64 <= count) {
+        ITER_64_BYTES;
+    }
+    acc = _mm512_add_epi64(acc, _mm512_sad_epu8(local, _mm512_setzero_si512()));
+
+#undef ITER_64_BYTES
+
+    /* Reduce 512-bit accumulator to scalar. */
+    __m256i acc_lo = _mm512_castsi512_si256(acc);
+    __m256i acc_hi = _mm512_extracti64x4_epi64(acc, 1);
+    __m256i acc256 = _mm256_add_epi64(acc_lo, acc_hi);
+    bits += _mm256_extract_epi64(acc256, 0);
+    bits += _mm256_extract_epi64(acc256, 1);
+    bits += _mm256_extract_epi64(acc256, 2);
+    bits += _mm256_extract_epi64(acc256, 3);
+
+    /* Part C: count the remaining bytes. */
+    for (; i < count; i++) {
+        bits += bitsinbyte[p[i]];
+    }
+
+    return bits;
+}
 #endif
 
 /* The scalar version of popcount. Uses hardware POPCNT instruction via
@@ -278,8 +362,12 @@ long long popcountNEON(void *s, long n) {
  * work with an input string length up to 512 MB or more (server.proto_max_bulk_len) */
 long long serverPopcount(void *s, long count) {
 #if HAVE_X86_SIMD
-    /* If length of s >= 256 bits and the CPU supports AVX2,
-     * we prefer to use the SIMD version */
+    /* Prefer AVX-512 for 64+ bytes, then AVX2 for 32+ bytes. */
+    if (count >= 64 &&
+        __builtin_cpu_supports("avx512f") &&
+        __builtin_cpu_supports("avx512bw")) {
+        return popcountAVX512(s, count);
+    }
     if (count >= 32 && __builtin_cpu_supports("avx2")) {
         return popcountAVX2(s, count);
     }
