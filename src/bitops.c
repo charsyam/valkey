@@ -138,10 +138,44 @@ long long popcountAVX2(void *s, long count) {
 }
 #endif
 
-/* The scalar version of popcount based on lookup tables. */
+/* The scalar version of popcount. Uses hardware POPCNT instruction via
+ * __builtin_popcountll when available, otherwise falls back to manual
+ * bit manipulation with lookup tables. */
 long long popcountScalar(void *s, long count) {
     long long bits = 0;
     unsigned char *p = s;
+
+#if HAS_BUILTIN_POPCOUNTLL
+    /* Count initial bytes not aligned to 64 bit. */
+    while ((unsigned long)p & 7 && count) {
+        bits += bitsinbyte[*p++];
+        count--;
+    }
+
+    /* Count bits 56 bytes at a time (7 x uint64_t) using hardware POPCNT. */
+    uint64_t *p8 = (uint64_t *)p;
+    while (count >= 56) {
+        valkey_prefetch((char *)p8 + 256);
+        bits += __builtin_popcountll(*p8++);
+        bits += __builtin_popcountll(*p8++);
+        bits += __builtin_popcountll(*p8++);
+        bits += __builtin_popcountll(*p8++);
+        bits += __builtin_popcountll(*p8++);
+        bits += __builtin_popcountll(*p8++);
+        bits += __builtin_popcountll(*p8++);
+        count -= 56;
+    }
+
+    /* Count remaining 8-byte chunks. */
+    while (count >= 8) {
+        bits += __builtin_popcountll(*p8++);
+        count -= 8;
+    }
+
+    /* Count the remaining bytes. */
+    p = (unsigned char *)p8;
+    while (count--) bits += bitsinbyte[*p++];
+#else
     uint32_t *p4;
 
     /* Count initial bytes not aligned to 32 bit. */
@@ -155,7 +189,6 @@ long long popcountScalar(void *s, long count) {
     while (count >= 28) {
         uint32_t aux1, aux2, aux3, aux4, aux5, aux6, aux7;
 
-        valkey_prefetch((char *)p4 + 256);
         aux1 = *p4++;
         aux2 = *p4++;
         aux3 = *p4++;
@@ -189,6 +222,8 @@ long long popcountScalar(void *s, long count) {
     /* Count the remaining bytes. */
     p = (unsigned char *)p4;
     while (count--) bits += bitsinbyte[*p++];
+#endif
+
     return bits;
 }
 

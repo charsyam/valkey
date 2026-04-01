@@ -384,6 +384,10 @@ void setcpuaffinity(const char *cpulist);
 #define valkey_prefetch(addr) ((void)(addr))
 #endif
 
+/* __builtin_popcountll is supported by the same compilers that support
+ * __builtin_prefetch, so reuse the same version check. */
+#define HAS_BUILTIN_POPCOUNTLL HAS_BUILTIN_PREFETCH
+
 /* Check if we can compile x86 SIMD code */
 #if defined(__x86_64__) && ((defined(__GNUC__) && __GNUC__ >= 5) || (defined(__clang__) && __clang_major__ >= 4)) && defined(__has_attribute) && __has_attribute(target)
 #define HAVE_X86_SIMD 1
