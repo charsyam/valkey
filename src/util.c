@@ -717,7 +717,7 @@ int string2ul_base16_async_signal_safe(const char *src, size_t slen, unsigned lo
     size_t curr_char_idx = 0;
     unsigned long result = 0;
     int base = 16;
-    while ((-1 != (char_type = base_16_char_type(src[curr_char_idx]))) && curr_char_idx < slen) {
+    while (curr_char_idx < slen && (-1 != (char_type = base_16_char_type(src[curr_char_idx])))) {
         unsigned long curr_val = src[curr_char_idx] - ascii_to_dec[char_type];
         if ((result > ULONG_MAX / base) || (result > (ULONG_MAX - curr_val) / base)) /* Overflow. */
             return -1;
