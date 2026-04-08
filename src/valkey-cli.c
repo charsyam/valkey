@@ -9839,7 +9839,7 @@ static void LRUTestMode(void) {
                 LRUTestGenKey(key, sizeof(key));
                 valkeyAppendCommand(context, "SET %s %s", key, val);
             }
-            for (j = 0; j < LRU_CYCLE_PIPELINE_SIZE; j++) valkeyGetReply(context, (void **)&reply);
+            for (j = 0; j < LRU_CYCLE_PIPELINE_SIZE; j++) valkeyGetReply(context, NULL);
 
             /* Read cycle. */
             for (j = 0; j < LRU_CYCLE_PIPELINE_SIZE; j++) {
@@ -9853,6 +9853,7 @@ static void LRUTestMode(void) {
                     case VALKEY_REPLY_NIL: misses++; break;
                     default: hits++; break;
                     }
+                    freeReplyObject(reply);
                 }
             }
 
