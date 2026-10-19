@@ -92,8 +92,8 @@ TEST_F(UtilTest, TestString2llChunks) {
             long long expected = 0;
             if (negative) buf[0] = '-';
             for (int i = 0; i < digits; i++) {
-                buf[negative + i] = '1';
-                expected = expected * 10 + 1;
+                buf[negative + i] = '1' + i % 9;
+                expected = expected * 10 + (buf[negative + i] - '0');
             }
             if (negative) expected = -expected;
             size_t len = digits + negative;
@@ -111,7 +111,7 @@ TEST_F(UtilTest, TestString2llChunks) {
                     ASSERT_EQ(actual, 42);
                     ASSERT_EQ(string2ll(buf, len, NULL), 0);
                 }
-                buf[negative + i] = '1';
+                buf[negative + i] = '1' + i % 9;
             }
         }
     }
@@ -125,12 +125,19 @@ TEST_F(UtilTest, TestString2llGuardPages) {
     int result = mprotect(mem + page, page, PROT_READ | PROT_WRITE);
     EXPECT_EQ(result, 0);
     if (result == 0) {
-        for (size_t len = 1; len <= 19; len++) {
-            /* Check both ends: SIMD loads must not read before or after input. */
-            memset(mem + page, '1', len);
-            EXPECT_EQ(string2ll(mem + page, len, NULL), 1);
-            memset(mem + page * 2 - len, '1', len);
-            EXPECT_EQ(string2ll(mem + page * 2 - len, len, NULL), 1);
+        for (int negative = 0; negative <= 1; negative++) {
+            for (size_t digits = 1; digits <= 19; digits++) {
+                size_t len = digits + negative;
+                /* Check both ends, including 20-byte negative inputs. */
+                char *start = mem + page;
+                char *end = mem + page * 2 - len;
+                memset(start, '1', len);
+                if (negative) start[0] = '-';
+                EXPECT_EQ(string2ll(start, len, NULL), 1);
+                memset(end, '1', len);
+                if (negative) end[0] = '-';
+                EXPECT_EQ(string2ll(end, len, NULL), 1);
+            }
         }
     }
     EXPECT_EQ(munmap(mem, page * 3), 0);

@@ -649,8 +649,7 @@ static int string2llScalar(const char *s, size_t slen, long long *value) {
 }
 
 #if HAVE_X86_SIMD
-/* AVX2 has no byte-masked load. Pad a local buffer rather than reading past
- * either end of the input (which may be adjacent to an inaccessible page). */
+/* Read complete eight-digit chunks directly; no padding or input overread. */
 ATTRIBUTE_TARGET_AVX2
 static int string2llAVX2(const char *s, size_t slen, long long *value) {
     if (slen == 1) {
@@ -659,34 +658,32 @@ static int string2llAVX2(const char *s, size_t slen, long long *value) {
         if (value != NULL) *value = digit;
         return 1;
     }
-    if (slen < 8) return string2llScalar(s, slen, value);
-    if (slen >= LONG_STR_SIZE) return 0;
+    if (slen == 0 || slen >= LONG_STR_SIZE) return 0;
 
     int negative = s[0] == '-';
     const char *p = s + negative;
     size_t len = slen - negative;
     if (len > 19 || p[0] < '1' || p[0] > '9') return 0;
 
-    unsigned char buf[32];
-    memset(buf, '0', sizeof(buf));
-    memcpy(buf + sizeof(buf) - len, p, len);
-    __m256i digits = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)buf),
-                                     _mm256_set1_epi8('0'));
-    __m256i invalid = _mm256_subs_epu8(digits, _mm256_set1_epi8(9));
-    if (!_mm256_testz_si256(invalid, invalid)) return 0;
-
-    /* Reduce adjacent digits into pairs, then four-digit groups. */
-    __m256i pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010a));
-    __m256i groups = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x00010064));
-    __m128i upper = _mm256_extracti128_si256(groups, 1);
-    unsigned long long high = (unsigned int)_mm_extract_epi32(_mm256_castsi256_si128(groups), 3);
-    unsigned long long middle = (unsigned int)_mm_extract_epi32(upper, 0) * 10000ULL +
-                                (unsigned int)_mm_extract_epi32(upper, 1);
-    unsigned long long low = (unsigned int)_mm_extract_epi32(upper, 2) * 10000ULL +
-                             (unsigned int)_mm_extract_epi32(upper, 3);
-    /* This bound also keeps the following arithmetic within uint64_t. */
-    if (high > 922) return 0;
-    unsigned long long v = high * MULTIPLIER_10E16 + middle * MULTIPLIER_10E8 + low;
+    unsigned long long v = 0;
+    size_t prefix = len % 8;
+    for (size_t i = 0; i < prefix; i++) {
+        unsigned int digit = (unsigned char)*p++ - '0';
+        if (digit > 9) return 0;
+        v = v * 10 + digit;
+    }
+    for (size_t i = prefix; i < len; i += 8, p += 8) {
+        __m128i digits = _mm_sub_epi8(_mm_loadl_epi64((const __m128i *)p), _mm_set1_epi8('0'));
+        __m128i invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        /* Only the low eight bytes came from the input. */
+        if (_mm_cvtsi128_si64(invalid)) return 0;
+        __m128i pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        __m128i groups = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+        unsigned int chunk = (unsigned int)_mm_cvtsi128_si32(groups) * 10000 +
+                             (unsigned int)_mm_extract_epi32(groups, 1);
+        v = v * 100000000 + chunk;
+    }
+    /* At most 19 decimal digits fit in uint64_t; check the signed limit once. */
     if (v > (unsigned long long)LLONG_MAX + negative) return 0;
     if (value != NULL) *value = negative ? -(long long)(v - 1) - 1 : (long long)v;
     return 1;
