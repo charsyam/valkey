@@ -84,6 +84,58 @@ TEST_F(UtilTest, TestString2ll) {
     ASSERT_EQ(string2ll(buf, strlen(buf), &v), 0);
 }
 
+/* Exercise every chunk boundary, sign, and byte value, including embedded NUL. */
+TEST_F(UtilTest, TestString2llChunks) {
+    for (int negative = 0; negative <= 1; negative++) {
+        for (int digits = 1; digits <= 19; digits++) {
+            char buf[21];
+            long long expected = 0;
+            if (negative) buf[0] = '-';
+            for (int i = 0; i < digits; i++) {
+                buf[negative + i] = '1';
+                expected = expected * 10 + 1;
+            }
+            if (negative) expected = -expected;
+            size_t len = digits + negative;
+            long long actual = 0;
+            ASSERT_EQ(string2ll(buf, len, &actual), 1);
+            ASSERT_EQ(actual, expected);
+            ASSERT_EQ(string2ll(buf, len, NULL), 1);
+            for (int i = 0; i < digits; i++) {
+                for (int byte = 0; byte <= 255; byte++) {
+                    if (byte >= '0' && byte <= '9') continue;
+                    if (!negative && i == 0 && digits > 1 && byte == '-') continue;
+                    buf[negative + i] = (char)byte;
+                    actual = 42;
+                    ASSERT_EQ(string2ll(buf, len, &actual), 0);
+                    ASSERT_EQ(actual, 42);
+                    ASSERT_EQ(string2ll(buf, len, NULL), 0);
+                }
+                buf[negative + i] = '1';
+            }
+        }
+    }
+}
+
+TEST_F(UtilTest, TestString2llGuardPages) {
+    size_t page = sysconf(_SC_PAGESIZE);
+    char *mem = (char *)mmap(NULL, page * 3, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANON, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    int result = mprotect(mem + page, page, PROT_READ | PROT_WRITE);
+    EXPECT_EQ(result, 0);
+    if (result == 0) {
+        for (size_t len = 1; len <= 19; len++) {
+            /* Check both ends: SIMD loads must not read before or after input. */
+            memset(mem + page, '1', len);
+            EXPECT_EQ(string2ll(mem + page, len, NULL), 1);
+            memset(mem + page * 2 - len, '1', len);
+            EXPECT_EQ(string2ll(mem + page * 2 - len, len, NULL), 1);
+        }
+    }
+    EXPECT_EQ(munmap(mem, page * 3), 0);
+}
+
 TEST_F(UtilTest, TestString2l) {
     char buf[32];
     long v;

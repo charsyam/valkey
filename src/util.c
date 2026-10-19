@@ -1,4 +1,10 @@
 /*
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+/*
  * Copyright (c) 2009-2012, Redis Ltd.
  * Copyright (c) 2012, Twitter, Inc.
  * All rights reserved.
@@ -61,6 +67,10 @@
 
 #if HAVE_X86_SIMD
 #include <immintrin.h>
+#endif
+
+#if HAVE_ARM_NEON
+#include <arm_neon.h>
 #endif
 
 /* Glob-style pattern matching. */
@@ -638,6 +648,101 @@ static int string2llScalar(const char *s, size_t slen, long long *value) {
     return 1;
 }
 
+#if HAVE_X86_SIMD
+/* AVX2 has no byte-masked load. Pad a local buffer rather than reading past
+ * either end of the input (which may be adjacent to an inaccessible page). */
+ATTRIBUTE_TARGET_AVX2
+static int string2llAVX2(const char *s, size_t slen, long long *value) {
+    if (slen == 1) {
+        unsigned int digit = (unsigned char)s[0] - '0';
+        if (digit > 9) return 0;
+        if (value != NULL) *value = digit;
+        return 1;
+    }
+    if (slen < 8) return string2llScalar(s, slen, value);
+    if (slen >= LONG_STR_SIZE) return 0;
+
+    int negative = s[0] == '-';
+    const char *p = s + negative;
+    size_t len = slen - negative;
+    if (len > 19 || p[0] < '1' || p[0] > '9') return 0;
+
+    unsigned char buf[32];
+    memset(buf, '0', sizeof(buf));
+    memcpy(buf + sizeof(buf) - len, p, len);
+    __m256i digits = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)buf),
+                                     _mm256_set1_epi8('0'));
+    __m256i invalid = _mm256_subs_epu8(digits, _mm256_set1_epi8(9));
+    if (!_mm256_testz_si256(invalid, invalid)) return 0;
+
+    /* Reduce adjacent digits into pairs, then four-digit groups. */
+    __m256i pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010a));
+    __m256i groups = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x00010064));
+    __m128i upper = _mm256_extracti128_si256(groups, 1);
+    unsigned long long high = (unsigned int)_mm_extract_epi32(_mm256_castsi256_si128(groups), 3);
+    unsigned long long middle = (unsigned int)_mm_extract_epi32(upper, 0) * 10000ULL +
+                                (unsigned int)_mm_extract_epi32(upper, 1);
+    unsigned long long low = (unsigned int)_mm_extract_epi32(upper, 2) * 10000ULL +
+                             (unsigned int)_mm_extract_epi32(upper, 3);
+    /* This bound also keeps the following arithmetic within uint64_t. */
+    if (high > 922) return 0;
+    unsigned long long v = high * MULTIPLIER_10E16 + middle * MULTIPLIER_10E8 + low;
+    if (v > (unsigned long long)LLONG_MAX + negative) return 0;
+    if (value != NULL) *value = negative ? -(long long)(v - 1) - 1 : (long long)v;
+    return 1;
+}
+#endif
+
+#if HAVE_ARM_NEON
+/* Parse eight bytes at a time without reading outside the supplied string.
+ * Short inputs retain the scalar path to avoid SIMD setup overhead. */
+static int string2llNEON(const char *s, size_t slen, long long *value) {
+    if (slen == 1) {
+        unsigned int digit = (unsigned char)s[0] - '0';
+        if (digit > 9) return 0;
+        if (value != NULL) *value = digit;
+        return 1;
+    }
+    if (slen < 8) return string2llScalar(s, slen, value);
+    if (slen >= LONG_STR_SIZE) return 0;
+
+    int negative = s[0] == '-';
+    const char *p = s + negative;
+    size_t len = slen - negative;
+    if (len > 19 || p[0] < '1' || p[0] > '9') return 0;
+
+    unsigned long long v = 0;
+    size_t prefix = len % 8;
+    for (size_t i = 0; i < prefix; i++) {
+        unsigned int digit = (unsigned char)*p++ - '0';
+        if (digit > 9) return 0;
+        v = v * 10 + digit;
+    }
+    const uint8_t weights8[8] = {10, 1, 10, 1, 10, 1, 10, 1};
+    const uint16_t weights16[4] = {100, 1, 100, 1};
+    const uint32_t weights32[2] = {10000, 1};
+    unsigned long long limit = (unsigned long long)LLONG_MAX + negative;
+    for (size_t i = prefix; i < len; i += 8, p += 8) {
+        uint8x8_t digits = vsub_u8(vld1_u8((const uint8_t *)p), vdup_n_u8('0'));
+        if (vmaxv_u8(digits) > 9) return 0;
+        uint16x8_t weighted = vmull_u8(digits, vld1_u8(weights8));
+        uint16x4_t pairs = vpadd_u16(vget_low_u16(weighted), vget_high_u16(weighted));
+        uint32x4_t products = vmull_u16(pairs, vld1_u16(weights16));
+        uint32x2_t groups = vpadd_u32(vget_low_u32(products), vget_high_u32(products));
+        unsigned long long chunk = vaddvq_u64(vmull_u32(groups, vld1_u32(weights32)));
+        if (v > limit / 100000000 ||
+            (v == limit / 100000000 && chunk > limit % 100000000))
+            return 0;
+        v = v * 100000000 + chunk;
+    }
+    if (value != NULL) {
+        /* Avoid negating LLONG_MIN in signed arithmetic. */
+        *value = negative ? -(long long)(v - 1) - 1 : (long long)v;
+    }
+    return 1;
+}
+#endif
+
 #if HAVE_IFUNC && HAVE_X86_SIMD
 VALKEY_NO_SANITIZE("address")
 VALKEY_NO_SANITIZE("thread")
@@ -649,6 +754,7 @@ __attribute__((used)) static int (*string2ll_resolver(void))(const char *, size_
         __builtin_cpu_supports("avx512vl") &&
         __builtin_cpu_supports("avx512bw"))
         return string2llAVX512;
+    if (__builtin_cpu_supports("avx2")) return string2llAVX2;
     return string2llScalar;
 }
 
@@ -661,8 +767,13 @@ int string2ll(const char *s, size_t slen, long long *value) {
         __builtin_cpu_supports("avx512vl") &&
         __builtin_cpu_supports("avx512bw"))
         return string2llAVX512(s, slen, value);
+    if (__builtin_cpu_supports("avx2")) return string2llAVX2(s, slen, value);
 #endif
+#if HAVE_ARM_NEON
+    return string2llNEON(s, slen, value);
+#else
     return string2llScalar(s, slen, value);
+#endif
 }
 #endif /* HAVE_IFUNC && HAVE_X86_SIMD */
 
