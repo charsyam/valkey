@@ -183,12 +183,24 @@ GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape) {
 
     double longitude = shape->xy[0];
     double latitude = shape->xy[1];
+    if (shape->type == POLYGON_TYPE &&
+        (latitude < min_lat || latitude > max_lat || longitude < min_lon || longitude > max_lon ||
+         longitude - min_lon > 180 || max_lon - longitude > 180)) {
+        /* The spherical centroid can lie outside the bounding box (even beyond
+         * the supported latitude), or more than 180 degrees of longitude from
+         * one of its edges, where great circle distances wrap the other way.
+         * Then the search area estimated from it does not cover the bounding
+         * box. Use the bounding box midpoint for indexing, while keeping
+         * shape->xy unchanged for result distances. */
+        longitude = (min_lon + max_lon) / 2;
+        latitude = (min_lat + max_lat) / 2;
+    }
     /* radius_meters is calculated differently in different search types:
      * 1) CIRCULAR_TYPE, just use radius.
      * 2) RECTANGLE_TYPE, we use sqrt((width/2)^2 + (height/2)^2) to
      * calculate the distance from the center point to the corner
      * 3) POLYGON_TYPE, use height/width from the bounding box and
-     * use the centroid (as center) to calculate the distance. */
+     * use the search center to calculate the distance. */
     double radius_meters = 0.0;
     if (shape->type == CIRCULAR_TYPE) {
         /* For circular shapes, use the given radius directly. */
@@ -197,7 +209,7 @@ GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape) {
         /* For rectangles, calculate the diagonal as the radius. */
         radius_meters = sqrt((shape->t.r.width / 2) * (shape->t.r.width / 2) + (shape->t.r.height / 2) * (shape->t.r.height / 2));
     } else if (shape->type == POLYGON_TYPE) {
-        /* For polygons, use max distance from the centroid to the bounding box. */
+        /* For polygons, use max distance from the search center to the bounding box. */
         double dist_top_left = geohashGetDistance(longitude, latitude, min_lon, max_lat);
         double dist_top_right = geohashGetDistance(longitude, latitude, max_lon, max_lat);
         double dist_bottom_left = geohashGetDistance(longitude, latitude, min_lon, min_lat);

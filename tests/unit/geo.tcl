@@ -627,6 +627,122 @@ start_server {tags {"geo"}} {
         assert_equal {{The Reg Bartley Oval, Waratah Street, Rushcutters Bay, Sydney, Council of the City of Sydney, New South Wales, 2011, Australia} {Goodhope Street, Five Ways, Paddington, Eastern Suburbs, Sydney, Woollahra Municipal Council, New South Wales, 2021, Australia}} [r zrange "{points}dest" 0 -1]
     }
 
+    foreach sign {1 -1} {
+        test "GEOSEARCH BYPOLYGON with an out-of-range centroid - hemisphere $sign" {
+            r del points "{points}dest"
+            set low [expr {$sign * 85.0}]
+            set high [expr {$sign * 85.05}]
+            set polygon [list BYPOLYGON 4 -10 $low 10 $low 10 $high -10 $high]
+            r geoadd points 0 [expr {$sign * 85.04}] near \
+                0 [expr {$sign * 85.01}] far \
+                -9.9 [expr {$sign * 85.025}] west \
+                9.9 [expr {$sign * 85.025}] east \
+                0 [expr {$sign * 84.99}] outside \
+                10.1 [expr {$sign * 85.025}] outside_lon
+
+            assert_equal {east far near west} [lsort [r geosearch points {*}$polygon]]
+            assert_equal {east west} [lsort [r geosearch points {*}$polygon DESC COUNT 2]]
+            assert_equal 4 [r geosearchstore "{points}dest" points {*}$polygon]
+            assert_equal {east far near west} [lsort [r zrange "{points}dest" 0 -1]]
+
+            set closest [r geosearch points {*}$polygon ASC COUNT 2 WITHDIST WITHCOORD]
+            assert_equal {near far} [lmap item $closest {lindex $item 0}]
+            assert_equal 2 [r geosearchstore "{points}dest" points {*}$polygon ASC COUNT 2 STOREDIST]
+            assert_equal {near far} [r zrange "{points}dest" 0 -1]
+            # Distances must still use the spherical centroid, not the index center.
+            set centroid_lat [expr {$sign * 85.100210655096}]
+            foreach item $closest {
+                lassign $item member distance coords
+                assert_equal [lindex [r geopos points $member] 0] $coords
+                set expected [geo_distance 0 $centroid_lat {*}$coords]
+                assert_lessthan [expr {abs($distance - $expected)}] 0.001
+                assert_lessthan [expr {abs([r zscore "{points}dest" $member] - $expected)}] 0.001
+            }
+            r del points "{points}dest"
+        }
+    }
+
+    test {GEOSEARCH BYPOLYGON with a centroid outside the bounding box} {
+        r del points "{points}dest"
+        # The centroid of this wide box is at longitude 180, outside the box.
+        r geoadd points 0 5 mid -100 5 west 100 5 east 169 5 edge \
+            175 5 outside_lon 0 11 outside_lat
+        set polygon {BYPOLYGON 4 -170 0 170 0 170 10 -170 10}
+        set expected {east edge mid west}
+        assert_equal $expected [lsort [r geosearch points {*}$polygon]]
+        assert_equal {mid} [r geosearch points {*}$polygon DESC COUNT 1]
+        assert_equal 4 [r geosearchstore "{points}dest" points {*}$polygon]
+        assert_equal $expected [lsort [r zrange "{points}dest" 0 -1]]
+        foreach member $expected {
+            assert_equal [r zscore points $member] [r zscore "{points}dest" $member]
+        }
+
+        set ranked [r geosearch points {*}$polygon ASC WITHDIST WITHCOORD]
+        assert_equal $expected [lsort [lmap item $ranked {lindex $item 0}]]
+        assert_equal edge [lindex $ranked 0 0]
+        assert_equal mid [lindex $ranked end 0]
+        assert_equal 4 [r geosearchstore "{points}dest" points {*}$polygon STOREDIST]
+        assert_equal edge [r zrange "{points}dest" 0 0]
+        assert_equal mid [r zrange "{points}dest" -1 -1]
+        # Keep the original spherical centroid (180, 5.076733...), not the index midpoint.
+        foreach item $ranked {
+            lassign $item member distance coords
+            assert_equal [lindex [r geopos points $member] 0] $coords
+            set meters [geo_distance 180 5.076733016569718 {*}$coords]
+            assert_lessthan [expr {abs($distance - $meters)}] 0.001
+            assert_lessthan [expr {abs([r zscore "{points}dest" $member] - $meters)}] 0.001
+        }
+        set any [r geosearch points {*}$polygon COUNT 3 ANY]
+        assert_equal 3 [llength [lsort -unique $any]]
+        foreach member $any {
+            assert {[lsearch -exact $expected $member] >= 0}
+        }
+        r del points "{points}dest"
+    }
+
+    test {GEOSEARCH BYPOLYGON with a centroid far from one longitude edge} {
+        r del points "{points}dest"
+        # Vertices cluster near 179, so the centroid (176.25) is inside the box
+        # but more than 180 degrees from its western edge.
+        set expected {}
+        for {set lon -175} {$lon <= 175} {incr lon 25} {
+            r geoadd points $lon 5 p$lon
+            lappend expected p$lon
+        }
+        r geoadd points 179.5 5 outside_lon 0 11 outside_lat
+        set polygon {BYPOLYGON 8 -179 0 170 0 175 0 179 0 179 10 175 10 170 10 -179 10}
+        assert_equal [lsort $expected] [lsort [r geosearch points {*}$polygon]]
+        assert_equal {p175 p-175 p150} [r geosearch points {*}$polygon ASC COUNT 3]
+        assert_equal {p0 p-25} [r geosearch points {*}$polygon DESC COUNT 2]
+        assert_equal 3 [r geosearchstore "{points}dest" points {*}$polygon ASC COUNT 3]
+        assert_equal [lsort {p175 p-175 p150}] [lsort [r zrange "{points}dest" 0 -1]]
+        foreach member [r zrange "{points}dest" 0 -1] {
+            assert_equal [r zscore points $member] [r zscore "{points}dest" $member]
+        }
+
+        set ranked [r geosearch points {*}$polygon ASC WITHDIST WITHCOORD]
+        assert_equal [lsort $expected] [lsort [lmap item $ranked {lindex $item 0}]]
+        assert_equal {p175 p-175 p150} [lmap item [lrange $ranked 0 2] {lindex $item 0}]
+        assert_equal p0 [lindex $ranked end 0]
+        assert_equal [llength $expected] [r geosearchstore "{points}dest" points {*}$polygon STOREDIST]
+        assert_equal {p175 p-175 p150} [r zrange "{points}dest" 0 2]
+        assert_equal p0 [r zrange "{points}dest" -1 -1]
+        # The centroid is near the eastern edge, far from the index midpoint (0, 5).
+        foreach item $ranked {
+            lassign $item member distance coords
+            assert_equal [lindex [r geopos points $member] 0] $coords
+            set meters [geo_distance 176.2515019862166 5.013427320894113 {*}$coords]
+            assert_lessthan [expr {abs($distance - $meters)}] 0.001
+            assert_lessthan [expr {abs([r zscore "{points}dest" $member] - $meters)}] 0.001
+        }
+        set any [r geosearch points {*}$polygon COUNT 3 ANY]
+        assert_equal 3 [llength [lsort -unique $any]]
+        foreach member $any {
+            assert {[lsearch -exact $expected $member] >= 0}
+        }
+        r del points "{points}dest"
+    }
+
     test {GEOSEARCH BYPOLYGON across hemispheres} {
         r del points "{points}dest"
         r geoadd points -68.8798275589943 -44.61362078872198 "Departamento Paso de Indios, Chubut Province, 9207, Argentina"
@@ -650,7 +766,7 @@ start_server {tags {"geo"}} {
         r geoadd points 90.02549439668655 39.614491635004136 "Lopnur, Ruoqiang County, Bayingolin, Xinjiang, China"
         r geoadd points 118.27697664499283 26.579067066419547 "Yanping District, Nanping City, Fujian, China"
         r geoadd points 118.27697664499283 36.02277654389389 "S234, Yiyuan County, Zibo, Shandong, China"
-        assert_equal {{Via Palchetto, Altarello, IV Circoscrizione, Palermo, Sicily, 90132, Italy} {Yana Caves, Yana Caves Road, Yana, Kumata taluk, Uttara Kannada, Karnataka, India} {Ban Soak, Saysetha District, Attapeu, Laos} {Yanping District, Nanping City, Fujian, China} {Mwandila, Manyoni, Singida Region, Central Zone, Tanzania} {Harney County, Oregon, United States} {Trent Park Golf Course, Bramley Road, Cockfosters, London Borough of Enfield, London, Greater London, England, N14 4TN, United Kingdom}} [r geosearch points BYPOLYGON 33 -146.20062130262065 51.130912386593 -103.26379152330803 49.47193779943357 -63.315654670518995 50.93884489468163 -95.40642417874389 39.65534094349885 -77.4999298453865 26.73672845329922 -51.87745194229085 23.04646540450935 -8.42920299630615 41.60520661073045 -10.521785859954813 61.47846964761324 2.124111965940925 60.778434760758095 18.481092483619292 53.09061572914368 38.70573141092903 45.73303292470514 22.02205974562196 34.2426280008694 52.57520291900751 22.953137594767274 75.72278884992889 29.362381850764695 90.74676219754886 31.63413660453445 107.30623758289035 35.851039511158085 115.40629273520966 30.411873608761567 120.01593165018451 29.841092929180927 120.4535153988606 25.65037857240954 121.27924547967872 11.602225617909395 135.1015103851442 -16.60585394490754 129.87136213636785 -27.170064645188177 99.53888837265143 -26.498354216857965 37.56438677364021 -27.832463377991818 31.562753892887216 -13.63096249674378 20.629919303178035 9.515486567597444 11.209492263565085 32.02725659471969 5.4325413537034 35.55125756355285 -35.244014834951145 16.982781656720274 -75.35489645024853 11.812375133773651 -94.03343867618196 28.67577744862069 -124.16269338003593 36.64849855935148 -143.36084887326555 42.51835490888078]
+        assert_equal [lsort {{Via Palchetto, Altarello, IV Circoscrizione, Palermo, Sicily, 90132, Italy} {Yana Caves, Yana Caves Road, Yana, Kumata taluk, Uttara Kannada, Karnataka, India} {Ban Soak, Saysetha District, Attapeu, Laos} {Yanping District, Nanping City, Fujian, China} {Mwandila, Manyoni, Singida Region, Central Zone, Tanzania} {Harney County, Oregon, United States} {Trent Park Golf Course, Bramley Road, Cockfosters, London Borough of Enfield, London, Greater London, England, N14 4TN, United Kingdom}}] [lsort [r geosearch points BYPOLYGON 33 -146.20062130262065 51.130912386593 -103.26379152330803 49.47193779943357 -63.315654670518995 50.93884489468163 -95.40642417874389 39.65534094349885 -77.4999298453865 26.73672845329922 -51.87745194229085 23.04646540450935 -8.42920299630615 41.60520661073045 -10.521785859954813 61.47846964761324 2.124111965940925 60.778434760758095 18.481092483619292 53.09061572914368 38.70573141092903 45.73303292470514 22.02205974562196 34.2426280008694 52.57520291900751 22.953137594767274 75.72278884992889 29.362381850764695 90.74676219754886 31.63413660453445 107.30623758289035 35.851039511158085 115.40629273520966 30.411873608761567 120.01593165018451 29.841092929180927 120.4535153988606 25.65037857240954 121.27924547967872 11.602225617909395 135.1015103851442 -16.60585394490754 129.87136213636785 -27.170064645188177 99.53888837265143 -26.498354216857965 37.56438677364021 -27.832463377991818 31.562753892887216 -13.63096249674378 20.629919303178035 9.515486567597444 11.209492263565085 32.02725659471969 5.4325413537034 35.55125756355285 -35.244014834951145 16.982781656720274 -75.35489645024853 11.812375133773651 -94.03343867618196 28.67577744862069 -124.16269338003593 36.64849855935148 -143.36084887326555 42.51835490888078]]
     }
 
     test {GEOSEARCH BYPOLYGON overlapping edges} {
