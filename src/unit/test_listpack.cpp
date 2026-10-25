@@ -257,6 +257,194 @@ TEST_F(ListpackTest, listpackLpPrepend) {
     lpFree(lp);
 }
 
+TEST_F(ListpackTest, listpackBatchInsertPositions) {
+    unsigned char binary[] = {'a', 0, 255, 'z'};
+    listpackEntry entries[] = {{binary, sizeof(binary), 0}, {NULL, 0, INT64_MIN}, {(unsigned char *)"4096", 4, 0}};
+    for (int reserve = 0; reserve < 2; reserve++) {
+        for (int index = 0; index <= 4; index++) {
+            for (int where = LP_BEFORE; where <= LP_AFTER; where++) {
+                if (index == 4 && where == LP_AFTER) continue;
+                unsigned char *lp = lpNew(reserve ? 4096 : 0);
+                unsigned char *expected = createList();
+                for (unsigned int i = 0; i < 4; i++) {
+                    lp = lpAppend(lp, (unsigned char *)mixlist[i], strlen(mixlist[i]));
+                }
+                unsigned char *p = index == 4 ? NULL : lpSeek(lp, index);
+                unsigned char *inserted = NULL;
+                int insertion_index = index + (where == LP_AFTER);
+                lp = lpBatchInsert(lp, entries, 3, p, where, &inserted);
+
+                /* Single-entry insertion is the reference for the serialized
+                 * format as well as the before/after ordering. */
+                for (int i = 2; i >= 0; i--) {
+                    p = lpSeek(expected, insertion_index);
+                    if (p == NULL) p = expected + lpBytes(expected) - 1;
+                    if (entries[i].sval) {
+                        expected = lpInsertString(expected, entries[i].sval, entries[i].slen,
+                                                  p, LP_BEFORE, NULL);
+                    } else {
+                        expected = lpInsertInteger(expected, entries[i].lval, p, LP_BEFORE, NULL);
+                    }
+                }
+                EXPECT_EQ(lpLength(lp), 7u);
+                EXPECT_EQ(inserted, lpSeek(lp, insertion_index));
+                EXPECT_EQ(lpBytes(lp), lpBytes(expected));
+                if (lpBytes(lp) == lpBytes(expected)) {
+                    EXPECT_EQ(memcmp(lp, expected, lpBytes(lp)), 0);
+                }
+                EXPECT_EQ(lpValidateIntegrity(lp, lpBytes(lp), NULL, NULL, 0), 1);
+                unsigned int backwards = 0;
+                for (p = lpLast(lp); p != NULL; p = lpPrev(lp, p)) backwards++;
+                EXPECT_EQ(backwards, 7u);
+                lpFree(expected);
+                lpFree(lp);
+            }
+        }
+    }
+}
+
+TEST_F(ListpackTest, listpackBatchInsertEncodingBoundaries) {
+    unsigned char value[16379];
+    memset(value, 'x', sizeof(value));
+    listpackEntry entries[] = {{value, 0, 0}, {value, 63, 0}, {value, 64, 0}, {value, 125, 0}, {value, 126, 0}, {value, 4095, 0}, {value, 4096, 0}, {value, 16378, 0}, {value, 16379, 0}, {NULL, 0, 127}, {NULL, 0, 128}, {NULL, 0, INT64_MAX}};
+    unsigned int count = sizeof(entries) / sizeof(entries[0]);
+    unsigned char *lp = lpNew(0);
+    unsigned char *expected = lpNew(0);
+    unsigned char *first = NULL;
+    /* This batch also exercises the temporary allocation for larger batches. */
+    lp = lpBatchInsert(lp, entries, count, lp + LP_HDR_SIZE, LP_BEFORE, &first);
+    for (unsigned int i = 0; i < count; i++) {
+        if (entries[i].sval) {
+            expected = lpAppend(expected, entries[i].sval, entries[i].slen);
+        } else {
+            expected = lpAppendInteger(expected, entries[i].lval);
+        }
+    }
+    EXPECT_EQ(first, lpFirst(lp));
+    EXPECT_EQ(lpLength(lp), count);
+    EXPECT_EQ(lpBytes(lp), lpBytes(expected));
+    if (lpBytes(lp) == lpBytes(expected)) {
+        EXPECT_EQ(memcmp(lp, expected, lpBytes(lp)), 0);
+    }
+    EXPECT_EQ(lpValidateIntegrity(lp, lpBytes(lp), NULL, NULL, 0), 1);
+    unsigned int backwards = 0;
+    for (unsigned char *p = lpLast(lp); p != NULL; p = lpPrev(lp, p)) backwards++;
+    EXPECT_EQ(backwards, count);
+    lpFree(expected);
+    lpFree(lp);
+}
+
+TEST_F(ListpackTest, listpackBatchInsertRandomized) {
+    unsigned int counts[] = {1, 2, 3, 8, 9, 16};
+    unsigned char strings[16][256];
+    listpackEntry entries[16];
+    unsigned char *lp = createList();
+    unsigned char *expected = lpDup(lp);
+    for (unsigned int round = 0; round < 96; round++) {
+        unsigned int count = counts[round % (sizeof(counts) / sizeof(counts[0]))];
+        for (unsigned int i = 0; i < count; i++) {
+            if (i % 3 == 0) {
+                entries[i].sval = NULL;
+                entries[i].lval = (long long)rand() * rand();
+                if (i % 2) entries[i].lval = -entries[i].lval;
+            } else {
+                entries[i].sval = strings[i];
+                entries[i].slen = rand() % sizeof(strings[i]);
+                for (unsigned int j = 0; j < entries[i].slen; j++) strings[i][j] = rand() % 256;
+            }
+        }
+        unsigned int index = rand() % (lpLength(lp) + 1);
+        int where = index == lpLength(lp) ? LP_BEFORE : rand() % 2;
+        unsigned int insertion_index = index + (where == LP_AFTER);
+        unsigned char *inserted = NULL;
+        lp = lpBatchInsert(lp, entries, count, lpSeek(lp, index), where, &inserted);
+        for (unsigned int i = 0; i < count; i++) {
+            unsigned char *p = lpSeek(expected, insertion_index + i);
+            if (p == NULL) p = expected + lpBytes(expected) - 1;
+            if (entries[i].sval) {
+                expected = lpInsertString(expected, entries[i].sval, entries[i].slen, p, LP_BEFORE, NULL);
+            } else {
+                expected = lpInsertInteger(expected, entries[i].lval, p, LP_BEFORE, NULL);
+            }
+        }
+        EXPECT_EQ(inserted, lpSeek(lp, insertion_index));
+        EXPECT_EQ(lpLength(lp), lpLength(expected));
+        EXPECT_EQ(lpBytes(lp), lpBytes(expected));
+        if (lpBytes(lp) == lpBytes(expected)) {
+            EXPECT_EQ(memcmp(lp, expected, lpBytes(lp)), 0);
+        }
+        EXPECT_EQ(lpValidateIntegrity(lp, lpBytes(lp), NULL, NULL, 0), 1);
+    }
+    lpFree(expected);
+    lpFree(lp);
+}
+
+TEST_F(ListpackTest, listpackBatchInsertEmptyAndOverflow) {
+    unsigned char *lp = createList();
+    unsigned char *expected = lpDup(lp);
+    unsigned char *first = lpFirst(lp);
+    EXPECT_EQ(lpBatchInsert(lp, NULL, 0, NULL, LP_BEFORE, &first), lp);
+    EXPECT_EQ(first, (unsigned char *)NULL);
+    EXPECT_EQ(lpBatchInsert(lp, NULL, UINT32_MAX, NULL, LP_BEFORE, NULL), (unsigned char *)NULL);
+    /* The size cannot fit even before the string contents are encoded. */
+    listpackEntry oversized = {(unsigned char *)"x", UINT32_MAX, 0};
+    EXPECT_EQ(lpBatchInsert(lp, &oversized, 1, NULL, LP_BEFORE, NULL), (unsigned char *)NULL);
+    EXPECT_EQ(lpBytes(lp), lpBytes(expected));
+    if (lpBytes(lp) == lpBytes(expected)) {
+        EXPECT_EQ(memcmp(lp, expected, lpBytes(lp)), 0);
+    }
+    lpFree(expected);
+    lpFree(lp);
+}
+
+TEST_F(ListpackTest, listpackBatchAppend) {
+    listpackEntry entries[3] = {{(unsigned char *)"member", 6, 0}, {NULL, 0, -12345}, {(unsigned char *)"", 0, 0}};
+    unsigned char *lp = lpNew(0);
+    unsigned char *expected = lpNew(0);
+    for (unsigned int round = 0; round < 2; round++) {
+        lp = lpBatchAppend(lp, entries, 3);
+        expected = lpAppend(expected, entries[0].sval, entries[0].slen);
+        expected = lpAppendInteger(expected, entries[1].lval);
+        expected = lpAppend(expected, entries[2].sval, entries[2].slen);
+        ASSERT_EQ(lpBytes(lp), lpBytes(expected));
+        EXPECT_EQ(memcmp(lp, expected, lpBytes(lp)), 0);
+        EXPECT_EQ(lpLength(lp), (round + 1) * 3u);
+    }
+    EXPECT_EQ(lpBatchAppend(lp, NULL, 0), lp);
+    listpackEntry oversized = {(unsigned char *)"x", UINT32_MAX, 0};
+    EXPECT_EQ(lpBatchAppend(lp, &oversized, 1), (unsigned char *)NULL);
+    EXPECT_EQ(memcmp(lp, expected, lpBytes(lp)), 0);
+    EXPECT_EQ(lpValidateIntegrity(lp, lpBytes(lp), NULL, NULL, 0), 1);
+    lpFree(expected);
+    lpFree(lp);
+}
+
+TEST_F(ListpackTest, listpackBatchInsertCountOverflow) {
+    unsigned char *lp = lpNew(2 * (UINT16_MAX + 2u) + LP_HDR_SIZE + 1);
+    for (unsigned int i = 0; i < UINT16_MAX - 1u; i++) lp = lpAppendInteger(lp, 0);
+    listpackEntry entries[2] = {{NULL, 0, 1}, {NULL, 0, 2}};
+    lp = lpBatchInsert(lp, entries, 2, NULL, LP_BEFORE, NULL);
+    EXPECT_EQ(lpGetNumElements(lp), LP_HDR_NUMELE_UNKNOWN);
+    EXPECT_EQ(lpLength(lp), UINT16_MAX + 1u);
+    lp = lpBatchInsert(lp, entries, 1, NULL, LP_BEFORE, NULL);
+    EXPECT_EQ(lpGetNumElements(lp), LP_HDR_NUMELE_UNKNOWN);
+    EXPECT_EQ(lpLength(lp), UINT16_MAX + 2u);
+    EXPECT_EQ(lpValidateIntegrity(lp, lpBytes(lp), NULL, NULL, 0), 1);
+    lpFree(lp);
+}
+
+TEST_F(ListpackTest, listpackBatchInsertPreservesMetadata) {
+    unsigned char *lp = createListWithMetadata();
+    listpackEntry entries[2] = {{(unsigned char *)"field3", 6, 0}, {(unsigned char *)"value3", 6, 0}};
+    lp = lpBatchInsert(lp, entries, 2, lpSeek(lp, 2), LP_BEFORE, NULL);
+    EXPECT_EQ(lpLength(lp), 6u);
+    EXPECT_EQ(lpCompare(lpSeek(lp, 2), entries[0].sval, entries[0].slen), 1u);
+    EXPECT_EQ(lpGetMetadataValue(lpGetMetadata(lp, lpSeek(lp, 1))), 1234567890);
+    EXPECT_EQ(lpGetMetadata(lp, lpSeek(lp, 3)), (unsigned char *)NULL);
+    EXPECT_EQ(lpValidateIntegrity(lp, lpBytes(lp), NULL, NULL, 1), 1);
+    lpFree(lp);
+}
+
 TEST_F(ListpackTest, listpackLpPrependInteger) {
     /* Test lpPrependInteger */
     unsigned char *lp;

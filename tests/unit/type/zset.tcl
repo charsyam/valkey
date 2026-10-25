@@ -128,6 +128,19 @@ start_server {tags {"zset"}} {
         }
 
         if {$encoding == "listpack"} {
+            test "ZADD inserts listpack pairs at every position with mixed encodings" {
+                r del ztmp
+                r zadd ztmp 2 b 4 d
+                r zadd ztmp 1 a 2.5 c inf z -inf first 2 123
+                assert_encoding listpack ztmp
+                set expected {first -inf a 1 123 2 b 2 c 2.5 d 4 z inf}
+                assert_equal $expected [r zrange ztmp 0 -1 withscores]
+                assert_equal {z d c b 123 a first} [r zrevrange ztmp 0 -1]
+                r restore ztmp-copy 0 [r dump ztmp] replace
+                assert_equal $expected [r zrange ztmp-copy 0 -1 withscores]
+                r del ztmp-copy
+            }
+
             test "ZADD in-place update handles listpack head, tail, and single element edge cases - $encoding" {
                 r del ztmp
                 r zadd ztmp 1 a 2 b 3 c

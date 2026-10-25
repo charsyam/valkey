@@ -514,30 +514,18 @@ static unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) {
     return lpDeleteRangeWithEntry(zl, &eptr, 2);
 }
 
-static unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, const char *ele, size_t ele_len, double score) {
-    unsigned char *sptr;
+/* Keep this out of line: when inlined into zzlInsert(), it slows down the
+ * sorted-position scan there and makes middle/tail ZADD slower. */
+static __attribute__((noinline)) unsigned char *
+zzlInsertAt(unsigned char *zl, unsigned char *eptr, const char *ele, size_t ele_len, double score) {
+    listpackEntry entries[2] = {{.sval = (unsigned char *)ele, .slen = ele_len}, {0}};
     char scorebuf[MAX_D2STRING_CHARS];
-    int scorelen = 0;
-    long long lscore;
-    int score_is_long = double2ll(score, &lscore);
-    if (!score_is_long) scorelen = d2string(scorebuf, sizeof(scorebuf), score);
-    if (eptr == NULL) {
-        zl = lpAppend(zl, (unsigned char *)ele, ele_len);
-        if (score_is_long)
-            zl = lpAppendInteger(zl, lscore);
-        else
-            zl = lpAppend(zl, (unsigned char *)scorebuf, scorelen);
-    } else {
-        /* Insert member before the element 'eptr'. */
-        zl = lpInsertString(zl, (unsigned char *)ele, ele_len, eptr, LP_BEFORE, &sptr);
-
-        /* Insert score after the member. */
-        if (score_is_long)
-            zl = lpInsertInteger(zl, lscore, sptr, LP_AFTER, NULL);
-        else
-            zl = lpInsertString(zl, (unsigned char *)scorebuf, scorelen, sptr, LP_AFTER, NULL);
+    if (!double2ll(score, &entries[1].lval)) {
+        entries[1].sval = (unsigned char *)scorebuf;
+        entries[1].slen = d2string(scorebuf, sizeof(scorebuf), score);
     }
-    return zl;
+    if (eptr == NULL) return lpBatchAppend(zl, entries, 2);
+    return lpBatchInsert(zl, entries, 2, eptr, LP_BEFORE, NULL);
 }
 
 /* Insert (element,score) pair in listpack. This function assumes the element is

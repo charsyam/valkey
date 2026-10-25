@@ -1021,6 +1021,108 @@ unsigned char *lpInsertInteger(unsigned char *lp, long long lval, unsigned char 
     return lpInsert(lp, NULL, intenc, enclen, p, where, newp);
 }
 
+/* Insert 'count' data entries in their array order, before or after 'p'. Passing
+ * NULL for 'p' appends the entries. LP_REPLACE and metadata entries are not
+ * supported. Entry strings and the entries array must not point into 'lp'.
+ *
+ * The entire batch is sized before changing the listpack, so growing the
+ * allocation and moving the suffix are each done at most once. Returns NULL
+ * on allocation failure or size overflow, leaving the original listpack valid.
+ * On success, 'newp' receives the first inserted entry, or NULL for an empty
+ * batch. Small batches, including field/value and member/score pairs, do not
+ * require a temporary heap allocation.
+ *
+ * The only current caller is zzlInsertAt(), which always passes a member/score
+ * pair (count == 2). Larger batches are supported for general use. */
+unsigned char *lpBatchInsert(unsigned char *lp, const listpackEntry *entries, unsigned int count, unsigned char *p, int where, unsigned char **newp) {
+    typedef struct {
+        uint64_t enclen;
+        unsigned char intenc[LP_MAX_INT_ENCODING_LEN];
+        unsigned char enctype;
+        unsigned char backlen_size;
+    } encodedEntry;
+    encodedEntry stack_entries[8];
+    encodedEntry *encoded = stack_entries;
+    uint64_t old_bytes = lpGetTotalBytes(lp);
+    uint64_t new_bytes = old_bytes;
+
+    assert(where == LP_BEFORE || where == LP_AFTER);
+    if (count == 0) {
+        if (newp) *newp = NULL;
+        return lp;
+    }
+
+    /* Every entry needs at least one encoding byte and one backlen byte. */
+    if (count > (UINT32_MAX - old_bytes) / 2) return NULL;
+    if (count > sizeof(stack_entries) / sizeof(stack_entries[0])) {
+        if (SIZE_MAX / count < sizeof(*encoded)) return NULL;
+        encoded = lp_malloc(sizeof(*encoded) * count);
+        if (encoded == NULL) return NULL;
+    }
+
+    for (unsigned int i = 0; i < count; i++) {
+        if (entries[i].sval) {
+            encoded[i].enctype = lpEncodeGetType(entries[i].sval, entries[i].slen,
+                                                 encoded[i].intenc, &encoded[i].enclen);
+        } else {
+            encoded[i].enctype = LP_ENCODING_INT;
+            lpEncodeIntegerGetType(entries[i].lval, encoded[i].intenc, &encoded[i].enclen);
+        }
+        encoded[i].backlen_size = lpEncodeBacklen(NULL, encoded[i].enclen);
+        new_bytes += encoded[i].enclen + encoded[i].backlen_size;
+        if (new_bytes > UINT32_MAX) {
+            if (encoded != stack_entries) lp_free(encoded);
+            return NULL;
+        }
+    }
+
+    if (p == NULL) {
+        p = lp + old_bytes - 1;
+    } else if (where == LP_AFTER) {
+        assert(p[0] != LP_EOF);
+        p = lpSkip(p);
+    }
+    ASSERT_INTEGRITY(lp, p);
+    size_t offset = p - lp;
+    if (new_bytes > lp_malloc_size(lp)) {
+        unsigned char *new_lp = lp_realloc(lp, new_bytes);
+        if (new_lp == NULL) {
+            if (encoded != stack_entries) lp_free(encoded);
+            return NULL;
+        }
+        lp = new_lp;
+    }
+
+    unsigned char *dst = lp + offset;
+    memmove(dst + (new_bytes - old_bytes), dst, old_bytes - offset);
+    if (newp) *newp = dst;
+    for (unsigned int i = 0; i < count; i++) {
+        if (encoded[i].enctype == LP_ENCODING_INT) {
+            memcpy(dst, encoded[i].intenc, encoded[i].enclen);
+        } else {
+            lpEncodeString(dst, entries[i].sval, entries[i].slen);
+        }
+        dst += encoded[i].enclen;
+        lpEncodeBacklen(dst, encoded[i].enclen);
+        dst += encoded[i].backlen_size;
+    }
+
+    uint32_t num_elements = lpGetNumElements(lp);
+    if (num_elements != LP_HDR_NUMELE_UNKNOWN) {
+        num_elements += count;
+        if (num_elements >= LP_HDR_NUMELE_UNKNOWN) num_elements = LP_HDR_NUMELE_UNKNOWN;
+        lpSetNumElements(lp, num_elements);
+    }
+    lpSetTotalBytes(lp, new_bytes);
+    if (encoded != stack_entries) lp_free(encoded);
+    return lp;
+}
+
+/* Append a batch of data entries in array order. Empty batches are a no-op. */
+unsigned char *lpBatchAppend(unsigned char *lp, const listpackEntry *entries, unsigned int count) {
+    return lpBatchInsert(lp, entries, count, NULL, LP_BEFORE, NULL);
+}
+
 /* Append the specified element 's' of length 'slen' at the head of the listpack. */
 unsigned char *lpPrepend(unsigned char *lp, unsigned char *s, uint32_t slen) {
     unsigned char *p = lpFirst(lp);

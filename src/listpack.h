@@ -69,6 +69,8 @@ unsigned char *lpShrinkToFit(unsigned char *lp);
 unsigned char *
 lpInsertString(unsigned char *lp, unsigned char *s, uint32_t slen, unsigned char *p, int where, unsigned char **newp);
 unsigned char *lpInsertInteger(unsigned char *lp, long long lval, unsigned char *p, int where, unsigned char **newp);
+unsigned char *lpBatchInsert(unsigned char *lp, const listpackEntry *entries, unsigned int count, unsigned char *p, int where, unsigned char **newp);
+unsigned char *lpBatchAppend(unsigned char *lp, const listpackEntry *entries, unsigned int count);
 void lpEncodeIntegerGetType(int64_t v, unsigned char *intenc, uint64_t *enclen);
 unsigned char *lpPrepend(unsigned char *lp, unsigned char *s, uint32_t slen);
 unsigned char *lpPrependInteger(unsigned char *lp, long long lval);
