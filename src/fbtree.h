@@ -17,6 +17,9 @@ typedef uint64_t fbtreeIterator[3];
 /* Internal API for testing */
 fbtreeIndex *fbtreeCreate(void);
 sds fbtreeInsert(fbtreeIndex *fbt, sds string);
+/* Replace a stored item's leading bytes, relocating it when necessary.
+ * Retains item storage; returns false without modification for invalid inputs. */
+bool fbtreeUpdatePrefix(fbtreeIndex *fbt, sds item, const char *prefix, size_t prefix_len);
 bool fbtreeDelete(fbtreeIndex *fbt, const_sds key);
 sds fbtreePopMin(fbtreeIndex *fbt);
 sds fbtreePopMax(fbtreeIndex *fbt);

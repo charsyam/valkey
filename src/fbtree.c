@@ -778,6 +778,47 @@ static int findChildIndex(innerNode *inner, const_sds string) {
     return left;
 }
 
+/* Locate the pointer-identical item while retaining the ancestor path.
+ * Equal values may span siblings, so failed equal-anchor searches continue right. */
+static bool findItemUpdatePath(node *n, const_sds item, innerNode **path, int *indices, int depth, leafNode **out_leaf, int *out_index, int *out_depth) {
+    if (n->is_leaf) {
+        leafNode *leaf = (leafNode *)n;
+        for (int i = 0; i < leaf->header.num_items; i++) {
+            if (leaf->values[i] == item) {
+                *out_leaf = leaf;
+                *out_index = i;
+                *out_depth = depth;
+                return true;
+            }
+        }
+        return false;
+    }
+    assert(depth < MAX_TREE_DEPTH);
+    innerNode *inner = (innerNode *)n;
+    int index = findChildIndex(inner, item);
+    while (index < inner->header.num_items) {
+        path[depth] = inner;
+        indices[depth] = index;
+        if (findItemUpdatePath(inner->children[index], item, path, indices, depth + 1,
+                               out_leaf, out_index, out_depth)) return true;
+        if (sdscmp(inner->anchors[index], item) != 0) break;
+        index++;
+    }
+    return false;
+}
+
+/* Compare [replacement prefix][existing suffix] without allocating a new key. */
+static int compareUpdatedPrefix(const_sds item, const char *prefix, size_t prefix_len, const_sds other) {
+    size_t item_len = sdslen(item), other_len = sdslen(other);
+    size_t common = other_len < prefix_len ? other_len : prefix_len;
+    int cmp = memcmp(prefix, other, common);
+    if (cmp) return cmp;
+    if (other_len < prefix_len) return 1;
+    common = item_len < other_len ? item_len : other_len;
+    cmp = memcmp(item + prefix_len, other + prefix_len, common - prefix_len);
+    return cmp ? cmp : (item_len > other_len) - (item_len < other_len);
+}
+
 static insertResult innerNodeHandleChildSplit(innerNode *parent, node *new_child, sds new_child_anchor, size_t new_child_idx) {
     if (parent->header.num_items == NODE_SIZE) {
         /* We're full - need to split */
@@ -1046,6 +1087,69 @@ bool fbtreeDelete(fbtreeIndex *fbt, const_sds item) {
     if (!result.delete_executed) return false;
 
     fbtreePostDeleteCleanup(fbt);
+    return true;
+}
+
+/* Update existing storage. If relocation is necessary, remove through the
+ * retained lookup path instead of searching for the same item a second time. */
+bool fbtreeUpdatePrefix(fbtreeIndex *fbt, sds item, const char *prefix, size_t prefix_len) {
+    if (!fbt->root || !item || !prefix || prefix_len > sdslen(item)) return false;
+    innerNode *path[MAX_TREE_DEPTH];
+    int indices[MAX_TREE_DEPTH];
+    leafNode *leaf;
+    int index, depth;
+    if (!findItemUpdatePath(fbt->root, item, path, indices, 0, &leaf, &index, &depth)) return false;
+    sds prev = index ? leaf->values[index - 1] : leaf->prev ? leafNodeHighKey(leaf->prev)
+                                                            : NULL;
+    sds next = index + 1 < leaf->header.num_items ? leaf->values[index + 1] : leaf->next ? leafNodeLowKey(leaf->next)
+                                                                                         : NULL;
+    bool relocate = (prev && compareUpdatedPrefix(item, prefix, prefix_len, prev) < 0) ||
+                    (next && compareUpdatedPrefix(item, prefix, prefix_len, next) > 0);
+    if (relocate) {
+        if (leaf->header.num_items == 1) {
+            if (leaf == fbt->leftmost_leaf) fbt->leftmost_leaf = leaf->next;
+            if (leaf == fbt->rightmost_leaf) fbt->rightmost_leaf = leaf->prev;
+        }
+        leafNodeRemoveAt(leaf, index);
+        sds anchor = index == leaf->header.num_items ? leafNodeHighKey(leaf) : NULL;
+        /* Unwind the saved path directly; ordinary deletion keeps its original
+         * recursive cleanup, without an additional helper call. */
+        for (int level = depth - 1; level >= 0; level--) {
+            innerNode *inner = path[level];
+            int child = indices[level];
+            inner->child_sizes[child]--;
+            if (anchor) {
+                inner->anchors[child] = anchor;
+                if (child == 0 || child == inner->header.num_items - 1) updateCommonPrefix(inner);
+                for (int j = 0; j < FEATURE_SIZE; j++)
+                    inner->features[j][child] = getFeatureByte(anchor, inner->prefix_len, j);
+            }
+            if (inner->child_sizes[child] == 0) {
+                freeEmptyNode(inner->children[child]);
+                innerNodeRemoveChild(inner, child);
+                anchor = inner->header.num_items && child == inner->header.num_items
+                             ? inner->anchors[inner->header.num_items - 1]
+                             : NULL;
+            } else {
+                inner->child_num_items[child] = inner->children[child]->num_items;
+                if (anchor) anchor = inner->anchors[inner->header.num_items - 1];
+            }
+        }
+        fbtreePostDeleteCleanup(fbt);
+        memmove(item, prefix, prefix_len);
+        fbtreeInsert(fbt, item);
+    } else {
+        memmove(item, prefix, prefix_len);
+        /* Anchors retain the SDS pointer, but their cached bytes must change. */
+        for (int level = depth - 1; level >= 0; level--) {
+            innerNode *inner = path[level];
+            int child = indices[level];
+            if (inner->anchors[child] != item) break;
+            if (child == 0 || child == inner->header.num_items - 1) updateCommonPrefix(inner);
+            for (int j = 0; j < FEATURE_SIZE; j++)
+                inner->features[j][child] = getFeatureByte(item, inner->prefix_len, j);
+        }
+    }
     return true;
 }
 

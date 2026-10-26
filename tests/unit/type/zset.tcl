@@ -116,6 +116,35 @@ start_server {tags {"zset"}} {
             assert_encoding $encoding ztmp
         }
 
+        if {$encoding == "btree"} {
+            test "Btree score updates preserve anchors, ranks and hashtable lookup" {
+                r del btree-update
+                set args {}
+                for {set i 0} {$i < 512} {incr i} {
+                    lappend args [expr {$i * 10}] [format "m%04d" $i]
+                }
+                r zadd btree-update {*}$args
+                assert_encoding btree btree-update
+                foreach i {0 60 61 121 122 182 243 304 365 426 487 511} {
+                    set member [format "m%04d" $i]
+                    set score [expr {$i * 10 + 1}]
+                    r zadd btree-update $score $member
+                    assert_equal $score [r zscore btree-update $member]
+                    assert_equal $i [r zrank btree-update $member]
+                }
+                r zadd btree-update 611 m0060
+                assert_equal 60 [r zrank btree-update m0060]
+                r zadd btree-update -1 m0128
+                assert_equal 0 [r zrank btree-update m0128]
+                r zadd btree-update 1000000 m0128
+                assert_equal 511 [r zrank btree-update m0128]
+                assert_equal 512 [r zcard btree-update]
+                r restore btree-copy 0 [r dump btree-update] replace
+                assert_equal [r zrange btree-update 0 -1 withscores] [r zrange btree-copy 0 -1 withscores]
+                r del btree-update btree-copy
+            }
+        }
+
         test "ZSET basic ZADD and score update - $encoding" {
             r del ztmp
             r zadd ztmp 10 x

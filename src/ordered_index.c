@@ -108,12 +108,10 @@ void orderedIndexDelete(OrderedIndex *oi, OrderedIndexItem *item) {
 }
 
 OrderedIndexItem *orderedIndexUpdateScore(OrderedIndex *oi, OrderedIndexItem *item, double newscore) {
-    const_sds packed = (const_sds)item;
-    size_t ele_len;
-    const char *ele = unpackElement(packed, &ele_len);
-    sds new_packed = packScoreElement(newscore, ele, ele_len);
-    fbtreeDelete((fbtreeIndex *)oi, packed);
-    return (OrderedIndexItem *)fbtreeInsert((fbtreeIndex *)oi, new_packed);
+    uint64_t sortable = scoreToSortable(newscore);
+    bool updated = fbtreeUpdatePrefix((fbtreeIndex *)oi, (sds)item, (const char *)&sortable, SCORE_SIZE);
+    serverAssert(updated);
+    return item;
 }
 
 OrderedIndexItem *orderedIndexPopFirst(OrderedIndex *oi) {

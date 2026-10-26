@@ -139,6 +139,132 @@ class FbtreeTest : public ::testing::Test {
 
 /* ========== Basic Lifecycle Tests ========== */
 
+TEST_F(FbtreeTest, PrefixUpdateKeepsPositionAndIdentity) {
+    sds first = insert("100:a"), middle = insert("200:b"), last = insert("300:c");
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, middle, "250", 3));
+    EXPECT_EQ(fbtreeGetAtRank(fbt, 1), middle);
+    EXPECT_EQ(memcmp(middle, "250:b", 5), 0);
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, middle, "400", 3));
+    EXPECT_EQ(fbtreeGetAtRank(fbt, 2), middle);
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, middle, "250", 3));
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, first, "050", 3));
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, last, "350", 3));
+    EXPECT_FALSE(fbtreeUpdatePrefix(fbt, middle, "123456789", 9));
+    sds absent = createString("250:absent");
+    EXPECT_FALSE(fbtreeUpdatePrefix(fbt, absent, "251", 3));
+    sdsfree(absent);
+    expectValid();
+}
+
+TEST_F(FbtreeTest, PrefixUpdateRefreshesMultilevelAnchors) {
+    enum { COUNT = NODE_SIZE * NODE_SIZE + 200 };
+    sds items[COUNT];
+    char key[48], prefix[9];
+    for (int i = 0; i < COUNT; i++) {
+        snprintf(key, sizeof(key), "%08u:member%05u", (unsigned)i * 10, (unsigned)i);
+        items[i] = insert(key);
+    }
+    ASSERT_GE(fbtreeHeight(fbt), 3u);
+    for (int i = NODE_SIZE - 1; i < COUNT; i += NODE_SIZE) {
+        snprintf(prefix, sizeof(prefix), "%08u", (unsigned)i * 10 + 1);
+        ASSERT_TRUE(fbtreeUpdatePrefix(fbt, items[i], prefix, 8));
+        EXPECT_EQ(fbtreeGetIndexOfItem(fbt, items[i]), i);
+        EXPECT_EQ(fbtreeGetAtRank(fbt, i), items[i]);
+        expectValid();
+    }
+    snprintf(prefix, sizeof(prefix), "%08u", (unsigned)(COUNT - 1) * 10 + 1);
+    ASSERT_TRUE(fbtreeUpdatePrefix(fbt, items[COUNT - 1], prefix, 8));
+    expectValid();
+}
+
+TEST_F(FbtreeTest, PrefixUpdateHandlesDuplicateSiblingKeys) {
+    for (int i = 0; i < NODE_SIZE * 3; i++) insert("100:duplicate");
+    sds first = (sds)fbtreeGetAtRank(fbt, 0);
+    sds middle = (sds)fbtreeGetAtRank(fbt, NODE_SIZE);
+    sds last = (sds)fbtreeGetAtRank(fbt, NODE_SIZE * 3 - 1);
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, middle, "101", 3));
+    EXPECT_EQ(fbtreeGetIndexOfItem(fbt, middle), NODE_SIZE * 3 - 1);
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, middle, "100", 3));
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, first, "099", 3));
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, last, "101", 3));
+    EXPECT_EQ(fbtreeGetIndexOfItem(fbt, last), NODE_SIZE * 3 - 1);
+    expectValid();
+}
+
+TEST_F(FbtreeTest, PrefixUpdateRebuildsSpilledCommonPrefix) {
+    char key[320];
+    for (int i = 0; i < NODE_SIZE * 3; i++) {
+        memset(key, 'a', sizeof(key));
+        snprintf(key + 300, 7, "%06u", (unsigned)i);
+        fbtreeInsert(fbt, sdsnewlen(key, sizeof(key)));
+    }
+    sds last = (sds)fbtreePeekMax(fbt);
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, last, "b", 1));
+    expectValid();
+    EXPECT_TRUE(fbtreeUpdatePrefix(fbt, last, "a", 1));
+    expectValid();
+    EXPECT_EQ(fbtreeGetAtRank(fbt, NODE_SIZE * 3 - 1), last);
+}
+
+static int comparePrefixUpdateItems(const void *a, const void *b) {
+    return sdscmp(*(sds const *)a, *(sds const *)b);
+}
+
+TEST_F(FbtreeTest, PrefixUpdateRandomMovesMatchSortedReference) {
+    enum { COUNT = TEST_THREE_LEVEL_ITEMS,
+           UPDATES = 4096 };
+    sds items[COUNT], sorted[COUNT];
+    char key[40], prefix[9];
+    uint32_t state = 123456789;
+    for (int i = 0; i < COUNT; i++) {
+        snprintf(key, sizeof(key), "%08u:member%05u", (unsigned)i * 10, (unsigned)i);
+        items[i] = insert(key);
+    }
+    for (int step = 0; step < UPDATES; step++) {
+        state = state * 1664525u + 1013904223u;
+        int index = state % COUNT;
+        state = state * 1664525u + 1013904223u;
+        snprintf(prefix, sizeof(prefix), "%08u", (unsigned)(state % 100000000u));
+        ASSERT_TRUE(fbtreeUpdatePrefix(fbt, items[index], prefix, 8));
+        ASSERT_EQ(memcmp(items[index], prefix, 8), 0);
+        ASSERT_EQ(fbtreeLength(fbt), (unsigned long)COUNT);
+        if (step % 64 == 0 || step == UPDATES - 1) {
+            memcpy(sorted, items, sizeof(sorted));
+            qsort(sorted, COUNT, sizeof(sds), comparePrefixUpdateItems);
+            expectValid();
+            for (int i = 0; i < COUNT; i++) {
+                ASSERT_EQ(fbtreeGetAtRank(fbt, i), sorted[i]);
+                ASSERT_EQ(fbtreeGetIndexOfItem(fbt, sorted[i]), i);
+            }
+        }
+    }
+}
+
+TEST_F(FbtreeTest, PrefixUpdateRelocatesOutOfSingletonLeaf) {
+    enum { COUNT = NODE_SIZE * 3 };
+    sds items[COUNT];
+    char key[32];
+    for (int i = 0; i < COUNT; i++) {
+        snprintf(key, sizeof(key), "%08u:member%05u", (unsigned)i * 10, (unsigned)i);
+        items[i] = insert(key);
+    }
+    for (int i = 1; i < COUNT - 1; i++) ASSERT_TRUE(fbtreeDelete(fbt, items[i]));
+    ASSERT_TRUE(fbtreeUpdatePrefix(fbt, items[0], "99999999", 8));
+    EXPECT_EQ(fbtreeGetAtRank(fbt, 1), items[0]);
+    expectValid();
+    ASSERT_TRUE(fbtreeDelete(fbt, items[0]));
+    sds item = items[COUNT - 1];
+    ASSERT_TRUE(fbtreeUpdatePrefix(fbt, item, "00000000", 8));
+    EXPECT_EQ(fbtreeGetAtRank(fbt, 0), item);
+    EXPECT_EQ(fbtreeLength(fbt), 1UL);
+    expectValid();
+    sds neighbor = insert("10000000:other");
+    ASSERT_TRUE(fbtreeUpdatePrefix(fbt, item, "99999999", 8));
+    EXPECT_EQ(fbtreeGetAtRank(fbt, 0), neighbor);
+    EXPECT_EQ(fbtreeGetAtRank(fbt, 1), item);
+    expectValid();
+}
+
 TEST_F(FbtreeTest, CreateAndFree) {
     ASSERT_NE(fbt, nullptr);
     expectValid();
