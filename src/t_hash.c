@@ -2776,6 +2776,39 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
             }
             goto set_deferred_response;
         }
+        /* For small distinct samples from a large hashtable, try physical
+         * random entries first. count^2 <= size/64 keeps the expected number
+         * of duplicate pairs below 1/128; larger requests use the reservoir. */
+        if (uniq && hash->encoding == OBJ_ENCODING_HASHTABLE && count <= size / count / 64) {
+            hashtable *seen = hashtableCreate(&sdsReplyHashtableType);
+            listpackEntry *fields = zmalloc(sizeof(listpackEntry) * count);
+            listpackEntry *values = withvalues ? zmalloc(sizeof(listpackEntry) * count) : NULL;
+            unsigned long sampled = 0;
+            bool oldstate, failed = false;
+            hashTypeIgnoreTTL(hash, true, &oldstate);
+            while (sampled < count) {
+                void *entry;
+                if (!hashtableFairRandomEntry(objectGetVal(hash), &entry) || entryIsExpired(entry) ||
+                    !hashtableAdd(seen, entry)) {
+                    failed = true;
+                    break;
+                }
+                sds field = entryGetField(entry);
+                fields[sampled].sval = (unsigned char *)field;
+                fields[sampled].slen = sdslen(field);
+                if (withvalues) values[sampled].sval = (unsigned char *)entryGetValue(entry, &values[sampled].slen);
+                sampled++;
+            }
+            hashTypeIgnoreTTL(hash, oldstate, NULL);
+            hashtableRelease(seen);
+            if (!failed) {
+                hrandfieldReplyWithListpack(wpc, sampled, fields, values);
+                reply_size = sampled;
+            }
+            zfree(fields);
+            zfree(values);
+            if (!failed) goto set_deferred_response;
+        }
         if (!uniq) {
             /* With replacement: collect the live fields once, then draw. */
             listpackEntry *fields = zmalloc(sizeof(listpackEntry) * size);

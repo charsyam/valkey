@@ -1608,6 +1608,35 @@ start_server {tags {"hashexpire"}} {
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
+    test "HRANDFIELD - positive count on future and expired-heavy hashtable" {
+        r FLUSHALL
+        r DEBUG SET-ACTIVE-EXPIRE 0
+        set fields {}
+        set names {}
+        for {set i 0} {$i < 1024} {incr i} {
+            lappend fields f$i v$i
+            lappend names f$i
+        }
+        r HSET myhash {*}$fields
+        r HEXPIRE myhash 3600 FIELDS 1 f0
+        assert_equal hashtable [r OBJECT ENCODING myhash]
+        set result [r HRANDFIELD myhash 2 WITHVALUES]
+        assert_equal 4 [llength $result]
+        foreach {field value} $result {
+            assert_equal [r HGET myhash $field] $value
+        }
+
+        r HPEXPIRE myhash 1 FIELDS 1020 {*}[lrange $names 0 1019]
+        after 20
+        assert_equal 1024 [r HLEN myhash]
+        set result [r HRANDFIELD myhash 2]
+        assert_equal 2 [llength [lsort -unique $result]]
+        foreach field $result {
+            assert {$field in {f1020 f1021 f1022 f1023}}
+        }
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
     test "HRANDFIELD - returns null response when all fields are expired" {
         r FLUSHALL
         r DEBUG SET-ACTIVE-EXPIRE 0
