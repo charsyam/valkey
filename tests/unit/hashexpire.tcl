@@ -1621,6 +1621,30 @@ start_server {tags {"hashexpire"}} {
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
     
+    test "HRANDFIELD - negative count samples live fields from expired-heavy hashtable" {
+        r FLUSHALL
+        r DEBUG SET-ACTIVE-EXPIRE 0
+        set fields {}
+        set names {}
+        for {set i 0} {$i < 1024} {incr i} {
+            lappend fields expired$i value$i
+            lappend names expired$i
+        }
+        r HSET myhash {*}$fields
+        r HSET myhash live0 value0 live1 value1 live2 value2 live3 value3
+        assert_equal hashtable [r OBJECT ENCODING myhash]
+        r HPEXPIRE myhash 1 FIELDS 1024 {*}$names
+        after 20
+        assert_equal 1028 [r HLEN myhash]
+        set result [r HRANDFIELD myhash -16 WITHVALUES]
+        assert_equal 32 [llength $result]
+        foreach {field value} $result {
+            assert {$field in {live0 live1 live2 live3}}
+            assert_equal [r HGET myhash $field] $value
+        }
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
     foreach cmd {RENAME RESTORE} {
         test "$cmd Preserves Field TTLs" {
             r FLUSHALL

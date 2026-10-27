@@ -2715,15 +2715,20 @@ static inline void hashTypeCurrentToEntry(hashTypeIterator *hi, int withvalues, 
     }
 }
 
-/* Collect every live (non-expired) field into the caller-provided arrays,
- * which must have room for hashTypeLength(o) entries. Returns the number of
- * live fields collected. */
-static unsigned long hashTypeCollectLive(robj *o, int withvalues, listpackEntry *fields, listpackEntry *values) {
+/* Collect live fields without reserving space for expired physical entries. */
+static unsigned long hashTypeCollectLive(robj *o, int withvalues, listpackEntry **fields, listpackEntry **values) {
     hashTypeIterator hi;
-    unsigned long n = 0;
+    unsigned long n = 0, capacity = 0, size = hashTypeLength(o);
+    *fields = NULL;
+    *values = NULL;
     hashTypeInitIterator(o, &hi);
     while (hashTypeNext(&hi) != C_ERR) {
-        hashTypeCurrentToEntry(&hi, withvalues, &fields[n], withvalues ? &values[n] : NULL);
+        if (n == capacity) {
+            capacity = capacity ? (capacity <= size / 2 ? capacity * 2 : size) : (size < 16 ? size : 16);
+            *fields = zrealloc(*fields, sizeof(listpackEntry) * capacity);
+            if (withvalues) *values = zrealloc(*values, sizeof(listpackEntry) * capacity);
+        }
+        hashTypeCurrentToEntry(&hi, withvalues, &(*fields)[n], withvalues ? &(*values)[n] : NULL);
         n++;
     }
     hashTypeResetIterator(&hi);
@@ -2778,9 +2783,8 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
         }
         if (!uniq) {
             /* With replacement: collect the live fields once, then draw. */
-            listpackEntry *fields = zmalloc(sizeof(listpackEntry) * size);
-            listpackEntry *values = withvalues ? zmalloc(sizeof(listpackEntry) * size) : NULL;
-            unsigned long live = hashTypeCollectLive(hash, withvalues, fields, values);
+            listpackEntry *fields, *values;
+            unsigned long live = hashTypeCollectLive(hash, withvalues, &fields, &values);
             while (live > 0 && count--) {
                 unsigned long idx = rand() % live;
                 hrandfieldReplyWithListpack(wpc, 1, &fields[idx], values ? &values[idx] : NULL);
