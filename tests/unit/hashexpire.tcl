@@ -1505,6 +1505,40 @@ start_server {tags {"hashexpire"}} {
 
     }
 
+    test "HRANDFIELD - negative count on future and expired-heavy hashtable" {
+        r FLUSHALL
+        r DEBUG SET-ACTIVE-EXPIRE 0
+        set fields {}
+        set names {}
+        for {set i 0} {$i < 1024} {incr i} {
+            lappend fields f$i v$i
+            lappend names f$i
+        }
+        r HSET myhash {*}$fields
+        r HEXPIRE myhash 3600 FIELDS 1 f0
+        assert_equal hashtable [r OBJECT ENCODING myhash]
+        set result [r HRANDFIELD myhash -5 WITHVALUES]
+        assert_equal 10 [llength $result]
+        foreach {field value} $result {
+            assert_equal [r HGET myhash $field] $value
+        }
+
+        r HPEXPIRE myhash 1 FIELDS 1020 {*}[lrange $names 0 1019]
+        after 20
+        assert_equal 1024 [r HLEN myhash]
+        set result [r HRANDFIELD myhash -5]
+        assert_equal 5 [llength $result]
+        foreach field $result {
+            assert {$field in {f1020 f1021 f1022 f1023}}
+        }
+        set result [r HRANDFIELD myhash -16]
+        assert_equal 16 [llength $result]
+        foreach field $result {
+            assert {$field in {f1020 f1021 f1022 f1023}}
+        }
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
      test "HRANDFIELD - CASE 2: The number of requested elements is greater than the number of elements inside the hash" {
         r FLUSHALL
         assert_equal {1} [r HSETEX myhash PX 1 fields 5 f1 v1 f2 v2 f3 v3 f4 v4 f5 v5]

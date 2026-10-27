@@ -2776,6 +2776,32 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
             }
             goto set_deferred_response;
         }
+        /* Probe at most one field per 128 physical fields. Repeated random
+         * probes become more expensive than a single scan for large counts,
+         * so those requests retain the collect-and-draw path. */
+        if (!uniq && hash->encoding == OBJ_ENCODING_HASHTABLE && count <= size / 128) {
+            bool oldstate = false;
+            hashTypeIgnoreTTL(hash, true, &oldstate);
+            while (count) {
+                void *entry;
+                if (!hashtableFairRandomEntry(objectGetVal(hash), &entry) || entryIsExpired(entry)) break;
+
+                sds field = entryGetField(entry);
+                listpackEntry f = {.sval = (unsigned char *)field, .slen = sdslen(field)};
+                listpackEntry v = {0};
+                if (withvalues) {
+                    size_t value_len;
+                    v.sval = (unsigned char *)entryGetValue(entry, &value_len);
+                    v.slen = value_len;
+                }
+                hrandfieldReplyWithListpack(wpc, 1, &f, withvalues ? &v : NULL);
+                reply_size++;
+                count--;
+                if (c->flag.close_asap) break;
+            }
+            hashTypeIgnoreTTL(hash, oldstate, NULL);
+            if (!count || c->flag.close_asap) goto set_deferred_response;
+        }
         if (!uniq) {
             /* With replacement: collect the live fields once, then draw. */
             listpackEntry *fields = zmalloc(sizeof(listpackEntry) * size);
