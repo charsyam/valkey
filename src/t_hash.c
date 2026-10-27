@@ -2802,6 +2802,48 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
             hashTypeIgnoreTTL(hash, oldstate, NULL);
             if (!count || c->flag.close_asap) goto set_deferred_response;
         }
+        /* At most two probes per requested field keep the probe budget below
+         * 1/128 of the physical size. Larger requests use the reservoir. */
+        if (uniq && hash->encoding == OBJ_ENCODING_HASHTABLE && count <= size / 256) {
+            hashtable *seen = hashtableCreate(&sdsReplyHashtableType);
+            listpackEntry *fields = zmalloc(sizeof(listpackEntry) * count);
+            listpackEntry *values = withvalues ? zmalloc(sizeof(listpackEntry) * count) : NULL;
+            unsigned long sampled = 0, duplicates = 0;
+            bool oldstate = false, failed = false;
+            hashTypeIgnoreTTL(hash, true, &oldstate);
+            while (sampled < count) {
+                void *entry;
+                if (!hashtableFairRandomEntry(objectGetVal(hash), &entry) || entryIsExpired(entry)) {
+                    failed = true;
+                    break;
+                }
+                if (!hashtableAdd(seen, entry)) {
+                    if (++duplicates == count) {
+                        failed = true;
+                        break;
+                    }
+                    continue;
+                }
+                sds field = entryGetField(entry);
+                fields[sampled].sval = (unsigned char *)field;
+                fields[sampled].slen = sdslen(field);
+                if (withvalues) {
+                    size_t value_len;
+                    values[sampled].sval = (unsigned char *)entryGetValue(entry, &value_len);
+                    values[sampled].slen = value_len;
+                }
+                sampled++;
+            }
+            hashTypeIgnoreTTL(hash, oldstate, NULL);
+            hashtableRelease(seen);
+            if (!failed) {
+                hrandfieldReplyWithListpack(wpc, sampled, fields, values);
+                reply_size = sampled;
+            }
+            zfree(fields);
+            zfree(values);
+            if (!failed) goto set_deferred_response;
+        }
         if (!uniq) {
             /* With replacement: collect the live fields once, then draw. */
             listpackEntry *fields = zmalloc(sizeof(listpackEntry) * size);
