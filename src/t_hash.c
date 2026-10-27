@@ -2715,15 +2715,20 @@ static inline void hashTypeCurrentToEntry(hashTypeIterator *hi, int withvalues, 
     }
 }
 
-/* Collect every live (non-expired) field into the caller-provided arrays,
- * which must have room for hashTypeLength(o) entries. Returns the number of
- * live fields collected. */
-static unsigned long hashTypeCollectLive(robj *o, int withvalues, listpackEntry *fields, listpackEntry *values) {
+/* Collect live fields without reserving space for expired physical entries. */
+static unsigned long hashTypeCollectLive(robj *o, int withvalues, listpackEntry **fields, listpackEntry **values) {
     hashTypeIterator hi;
-    unsigned long n = 0;
+    unsigned long n = 0, capacity = 0, size = hashTypeLength(o);
+    *fields = NULL;
+    *values = NULL;
     hashTypeInitIterator(o, &hi);
     while (hashTypeNext(&hi) != C_ERR) {
-        hashTypeCurrentToEntry(&hi, withvalues, &fields[n], withvalues ? &values[n] : NULL);
+        if (n == capacity) {
+            capacity = capacity ? (capacity <= size / 2 ? capacity * 2 : size) : (size < 16 ? size : 16);
+            *fields = zrealloc(*fields, sizeof(listpackEntry) * capacity);
+            if (withvalues) *values = zrealloc(*values, sizeof(listpackEntry) * capacity);
+        }
+        hashTypeCurrentToEntry(&hi, withvalues, &(*fields)[n], withvalues ? &(*values)[n] : NULL);
         n++;
     }
     hashTypeResetIterator(&hi);
@@ -2776,11 +2781,67 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
             }
             goto set_deferred_response;
         }
+        if (hash->encoding == OBJ_ENCODING_HASHTABLE && (!uniq || count < size)) {
+            /* Probe physical entries first. A ghost (or a duplicate for the
+             * distinct variant) sends us to one full live-field scan. Never
+             * retry here: dense ghosts must not cause repeated scans. */
+            hashtable *seen = uniq ? hashtableCreate(&setHashtableType) : NULL;
+            listpackEntry *sampled_fields = NULL, *sampled_values = NULL;
+            unsigned long sampled = 0, capacity = 0;
+            bool oldstate, failed = false;
+            hashTypeIgnoreTTL(hash, true, &oldstate);
+            while (sampled < count) {
+                void *entry;
+                if (!hashtableFairRandomEntry(objectGetVal(hash), &entry) || entryIsExpired(entry)) {
+                    failed = true;
+                    break;
+                }
+                sds field = entryGetField(entry);
+                if (uniq) {
+                    sds copy = sdsdup(field);
+                    if (!hashtableAdd(seen, copy)) {
+                        sdsfree(copy);
+                        failed = true;
+                        break;
+                    }
+                    if (sampled == capacity) {
+                        capacity = capacity ? (capacity <= count / 2 ? capacity * 2 : count) : (count < 16 ? count : 16);
+                        sampled_fields = zrealloc(sampled_fields, sizeof(listpackEntry) * capacity);
+                        if (withvalues) sampled_values = zrealloc(sampled_values, sizeof(listpackEntry) * capacity);
+                    }
+                    sampled_fields[sampled].sval = (unsigned char *)field;
+                    sampled_fields[sampled].slen = sdslen(field);
+                    if (withvalues) {
+                        sampled_values[sampled].sval = (unsigned char *)entryGetValue(entry, &sampled_values[sampled].slen);
+                    }
+                } else {
+                    listpackEntry f = {.sval = (unsigned char *)field, .slen = sdslen(field)};
+                    listpackEntry v;
+                    if (withvalues) v.sval = (unsigned char *)entryGetValue(entry, &v.slen);
+                    hrandfieldReplyWithListpack(wpc, 1, &f, withvalues ? &v : NULL);
+                    reply_size++;
+                    if (c->flag.close_asap) {
+                        sampled++;
+                        break;
+                    }
+                }
+                sampled++;
+            }
+            hashTypeIgnoreTTL(hash, oldstate, NULL);
+            if (seen) hashtableRelease(seen);
+            if (uniq && !failed) {
+                hrandfieldReplyWithListpack(wpc, sampled, sampled_fields, sampled_values);
+                reply_size = sampled;
+            }
+            zfree(sampled_fields);
+            zfree(sampled_values);
+            if (!failed) goto set_deferred_response;
+            if (!uniq) count -= sampled;
+        }
         if (!uniq) {
             /* With replacement: collect the live fields once, then draw. */
-            listpackEntry *fields = zmalloc(sizeof(listpackEntry) * size);
-            listpackEntry *values = withvalues ? zmalloc(sizeof(listpackEntry) * size) : NULL;
-            unsigned long live = hashTypeCollectLive(hash, withvalues, fields, values);
+            listpackEntry *fields, *values;
+            unsigned long live = hashTypeCollectLive(hash, withvalues, &fields, &values);
             while (live > 0 && count--) {
                 unsigned long idx = rand() % live;
                 hrandfieldReplyWithListpack(wpc, 1, &fields[idx], values ? &values[idx] : NULL);

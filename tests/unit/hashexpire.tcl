@@ -1608,6 +1608,70 @@ start_server {tags {"hashexpire"}} {
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
+    test "HRANDFIELD - volatile hashtable returns live fields after probing ghosts" {
+        r FLUSHALL
+        r DEBUG SET-ACTIVE-EXPIRE 0
+        set fields {}
+        set names {}
+        for {set i 0} {$i < 1024} {incr i} {
+            lappend fields expired$i value$i
+            lappend names expired$i
+        }
+        r HSET myhash {*}$fields
+        r HSET myhash live0 value0 live1 value1 live2 value2 live3 value3
+        assert_equal hashtable [r OBJECT ENCODING myhash]
+        r HPEXPIRE myhash 1 FIELDS 1024 {*}$names
+        after 20
+        assert_equal 1028 [r HLEN myhash]
+
+        for {set i 0} {$i < 20} {incr i} {
+            assert {[r HRANDFIELD myhash] in {live0 live1 live2 live3}}
+        }
+        set result [r HRANDFIELD myhash 16]
+        assert_equal {live0 live1 live2 live3} [lsort $result]
+        set result [r HRANDFIELD myhash -16]
+        assert_equal 16 [llength $result]
+        foreach field $result {
+            assert {$field in {live0 live1 live2 live3}}
+        }
+        set result [r HRANDFIELD myhash 16 WITHVALUES]
+        assert_equal 8 [llength $result]
+        foreach {field value} $result {
+            assert_equal [r HGET myhash $field] $value
+        }
+        set result [r HRANDFIELD myhash -16 WITHVALUES]
+        assert_equal 32 [llength $result]
+        foreach {field value} $result {
+            assert_equal [r HGET myhash $field] $value
+        }
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    test "HRANDFIELD - future TTL fields support distinct and repeated samples" {
+        r FLUSHALL
+        set fields {}
+        set names {}
+        for {set i 0} {$i < 1024} {incr i} {
+            lappend fields f$i v$i
+            lappend names f$i
+        }
+        r HSET myhash {*}$fields
+        assert_equal hashtable [r OBJECT ENCODING myhash]
+        r HEXPIRE myhash 3600 FIELDS 1024 {*}$names
+        set result [r HRANDFIELD myhash 5]
+        assert_equal 5 [llength [lsort -unique $result]]
+        set result [r HRANDFIELD myhash -5]
+        assert_equal 5 [llength $result]
+        set result [r HRANDFIELD myhash 5 WITHVALUES]
+        assert_equal 10 [llength $result]
+        foreach {field value} $result {
+            assert_equal [r HGET myhash $field] $value
+        }
+        r HPERSIST myhash FIELDS 1023 {*}[lrange $names 1 end]
+        assert_equal 5 [llength [lsort -unique [r HRANDFIELD myhash 5]]]
+        assert_equal 5 [llength [r HRANDFIELD myhash -5]]
+    }
+
     test "HRANDFIELD - returns null response when all fields are expired" {
         r FLUSHALL
         r DEBUG SET-ACTIVE-EXPIRE 0
