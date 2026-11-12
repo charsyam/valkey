@@ -2226,6 +2226,15 @@ static inline robj *createSharedStringFromSds(sds s) {
     return makeObjectShared(createObject(OBJ_STRING, s));
 }
 
+/* The original command table still finds a command by fullname after it is renamed. */
+static robj *createSharedCommandName(const char *fullname) {
+    struct serverCommand *command = lookupCommandByCStringLogic(server.orig_commands, fullname);
+    serverAssert(command != NULL);
+    sds name = sdsdup(command->current_name);
+    if (command->current_name == command->fullname) sdstoupper(name);
+    return createSharedStringFromSds(name);
+}
+
 /* These shared strings depend on the extended-redis-compatibility config and is
  * called at initialization. When the config is phased out, these
  * initializations can be moved back inside createSharedObjects() below. */
@@ -2346,8 +2355,8 @@ void createSharedObjects(void) {
     shared.zpopmax = createSharedString("ZPOPMAX");
     shared.multi = createSharedString("MULTI");
     shared.exec = createSharedString("EXEC");
-    shared.hset = createSharedString("HSET");
-    shared.hsetex = createSharedString("HSETEX");
+    shared.hset = createSharedCommandName("HSET");
+    shared.hsetex = createSharedCommandName("HSETEX");
     shared.hdel = createSharedString("HDEL");
     shared.hpexpireat = createSharedString("HPEXPIREAT");
     shared.hpersist = createSharedString("HPERSIST");
