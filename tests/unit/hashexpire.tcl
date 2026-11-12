@@ -5699,3 +5699,44 @@ start_server {tags {"hashexpire aof needs:debug external:skip"} overrides {appen
         }
     }
 }
+
+start_server {tags {"hashexpire aof external:skip"} overrides {appendonly yes appendfsync always rename-command {HSETEX MYHSETEX}}} {
+    test {Shared HSETEX name follows rename-command for AOF replay} {
+        assert_equal 1 [r MYHSETEX h EX 3600 FIELDS 1 f 1]
+        assert_equal 2 [r HINCRBY h f 1]
+        restart_server 0 true false
+        assert_equal 2 [r HGET h f]
+    }
+}
+
+start_server {tags {"hashexpire aof external:skip"} overrides {appendonly yes appendfsync always rename-command {HSET MYHSET}}} {
+    test {Shared HSET name follows rename-command for AOF replay} {
+        assert_equal 1 [r HSETEX h EX 3600 FIELDS 1 volatile 1]
+        assert_equal 1 [r HINCRBY h integer 1]
+        assert_equal 1 [r HINCRBYFLOAT h float 1]
+        assert_equal 1 [r HSETNX h other 1]
+        restart_server 0 true false
+        assert_equal 1 [r HGET h integer]
+        assert_equal 1 [r HGET h float]
+        assert_equal 1 [r HGET h other]
+    }
+}
+
+set hash_renames [list rename-command "HSET MYHSET" rename-command "HSETEX MYHSETEX"]
+start_server [list config_lines $hash_renames] {
+    start_server [list config_lines $hash_renames] {
+        set primary [srv -1 client]
+        set replica [srv 0 client]
+        $replica replicaof [srv -1 host] [srv -1 port]
+        wait_for_sync $replica
+
+        test {Shared HSET and HSETEX names replicate after rename-command} {
+            assert_equal 1 [$primary MYHSETEX h EX 3600 FIELDS 1 volatile 1]
+            assert_equal 2 [$primary HINCRBY h volatile 1]
+            assert_equal 1 [$primary HINCRBY h plain 1]
+            wait_for_ofs_sync $primary $replica
+            assert_equal 2 [$replica HGET h volatile]
+            assert_equal 1 [$replica HGET h plain]
+        } {} {needs:repl external:skip}
+    }
+}
