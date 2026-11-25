@@ -642,13 +642,17 @@ static expiryModificationResult hashTypeSetExpire(robj *o, sds field, mstime_t e
      *    lookup (via the validateEntry callback inside hashtableFindRef)
      *    apply the same visibility rules. */
     mstime_t current_expire = EXPIRY_NONE;
-    void **entry_ref = NULL; /* hashtable only */
+    void **entry_ref = NULL;    /* hashtable only */
+    unsigned char *fptr = NULL; /* listpack only */
     if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
-        unsigned char *vstr;
-        unsigned int vlen;
-        long long vll;
-        if (hashTypeGetFromListpack(o, field, &vstr, &vlen, &vll, &current_expire) < 0)
-            return EXPIRATION_MODIFICATION_NOT_EXIST;
+        unsigned char *zl = objectGetVal(o);
+        fptr = lpFirst(zl);
+        if (fptr) fptr = lpFind(zl, fptr, (unsigned char *)field, sdslen(field), 1);
+        if (fptr == NULL) return EXPIRATION_MODIFICATION_NOT_EXIST;
+        unsigned char *value_ptr = lpNext(zl, fptr);
+        serverAssert(value_ptr != NULL);
+        current_expire = hashTypeListpackGetExpiry(zl, value_ptr);
+        if (!hashTypeListpackFieldIsValid(current_expire)) return EXPIRATION_MODIFICATION_NOT_EXIST;
     } else {
         serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE);
         entry_ref = hashtableFindRef(objectGetVal(o), field);
@@ -675,8 +679,6 @@ static expiryModificationResult hashTypeSetExpire(robj *o, sds field, mstime_t e
      *    this path, so the handles located there are still valid. */
     if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = objectGetVal(o);
-        unsigned char *fptr = lpFind(zl, lpFirst(zl), (unsigned char *)field, sdslen(field), 1);
-        serverAssert(fptr != NULL);
         unsigned char *value_ptr = lpNext(zl, fptr);
         unsigned char *metadata_ptr = lpGetMetadata(zl, value_ptr);
         unsigned char intenc[LP_MAX_INT_ENCODING_LEN];

@@ -853,6 +853,28 @@ start_server {tags {"hashexpire"}} {
         assert {$ttl > 0}
     }
 
+    test {HEXPIRE - update a late listpack field with and without conditions} {
+        r FLUSHALL
+        set pairs {}
+        for {set i 0} {$i < 64} {incr i} {
+            lappend pairs field$i value$i
+        }
+        assert_equal 64 [r HSET myhash {*}$pairs]
+        assert_equal listpack [r OBJECT ENCODING myhash]
+
+        assert_equal {1} [r HEXPIRE myhash 120 FIELDS 1 field63]
+        assert_equal {1} [r HEXPIRE myhash 180 XX FIELDS 1 field63]
+        assert_equal {0} [r HEXPIRE myhash 60 NX FIELDS 1 field63]
+        assert_equal {0} [r HEXPIRE myhash 60 GT FIELDS 1 field63]
+        assert_equal {1} [r HEXPIRE myhash 60 LT FIELDS 1 field63]
+        assert_equal {1} [r HEXPIRE myhash 90 GT FIELDS 1 field63]
+        assert_equal {1} [r HEXPIRE myhash 240 FIELDS 1 field63]
+
+        assert_equal value63 [r HGET myhash field63]
+        assert_equal {-1} [r HTTL myhash FIELDS 1 field0]
+        assert_equal listpack [r OBJECT ENCODING myhash]
+    }
+
     test {HEXPIRE - TTL 0 deletes field} {
         r FLUSHALL
         r HSET myhash field1 goodbye
