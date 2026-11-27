@@ -518,3 +518,55 @@ start_cluster 2 0 {tags {external:skip cluster tls:skip}} {
         assert_equal 1 [regexp -all {myself} [R 0 cluster nodes]]
     }
 }
+
+start_cluster 2 0 {tags {external:skip cluster tls:skip}} {
+    test "PING rejects gossip IP without a NUL terminator" {
+        set gossip_id "0000000000000000000000000000000000c0ffee"
+        set sender_port [srv -1 port]
+        set packet [create_cluster_meet_packet [R 1 cluster myid] $sender_port [expr {$sender_port + 10000}] 1]
+        set packet [string replace $packet 12 13 [binary format S 0]]
+        append packet $gossip_id [binary format II 0 0]
+        append packet [string repeat A 46]
+        append packet [binary format SSSSS 1 2 1 0 0]
+        set packet [string replace $packet 4 7 [binary format I [string length $packet]]]
+
+        send_forged_ping $packet [expr {[srv 0 port] + 10000}]
+        assert_no_match "*$gossip_id*" [R 0 cluster nodes]
+    }
+
+    test "Unknown MEET cannot update a failed node from unterminated gossip IP" {
+        set target [R 1 cluster myid]
+        set target_port [srv -1 port]
+        set old_timeout [lindex [R 0 config get cluster-node-timeout] 1]
+        R 0 config set cluster-node-timeout 1000
+        pause_process [srv -1 pid]
+        wait_for_condition 1000 10 {
+            [string match "*$target *fail*" [R 0 cluster nodes]]
+        } else {
+            fail "Node never became failed"
+        }
+
+        set meet_count [CI 0 cluster_stats_messages_meet_received]
+        set unknown "0000000000000000000000000000000000badbee"
+        set packet [create_cluster_meet_packet $unknown $target_port [expr {$target_port + 10000}] 1]
+        append packet $target [binary format II 0 0]
+        append packet [string repeat A 46]
+        append packet [binary format SSSSS $target_port [expr {$target_port + 10000}] 1 0 0]
+        set packet [string replace $packet 4 7 [binary format I [string length $packet]]]
+
+        set sock [socket 127.0.0.1 [expr {[srv 0 port] + 10000}]]
+        fconfigure $sock -translation binary -buffering none -blocking 1
+        puts -nonewline $sock $packet
+        flush $sock
+        close $sock
+        wait_for_condition 1000 10 {
+            [CI 0 cluster_stats_messages_meet_received] > $meet_count
+        } else {
+            fail "Unknown MEET was never received"
+        }
+        assert_no_match "*$target [string repeat A 46]*" [R 0 cluster nodes]
+
+        resume_process [srv -1 pid]
+        R 0 config set cluster-node-timeout $old_timeout
+    }
+}

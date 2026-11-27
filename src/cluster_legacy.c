@@ -4079,6 +4079,14 @@ int clusterIsValidPacket(clusterLink *link) {
             return 0;
         }
 
+        for (uint16_t i = 0; i < count; i++) {
+            if (memchr(msg->data.ping.gossip[i].ip, '\0', NET_IP_STR_LEN) == NULL) {
+                serverLog(LL_WARNING, "Received invalid %s packet with unterminated gossip IP",
+                          clusterGetMessageTypeString(type));
+                return 0;
+            }
+        }
+
         /* If there is extension data, which doesn't have a fixed length,
          * loop through them and validate the length of it now. */
         if (msg->mflags[0] & CLUSTERMSG_FLAG0_EXT_DATA) {
